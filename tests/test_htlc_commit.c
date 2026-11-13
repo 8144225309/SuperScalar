@@ -593,7 +593,7 @@ int test_htlc_commit_mixed_dust_counted(void) {
 }
 
 /* ================================================================== */
-/* HC13 — #56 P2A CPFP anchor: gated, appended last, funded by to_remote */
+/* HC13 — #56 P2A CPFP anchor: gated, appended last, funded by the funder */
 /* ================================================================== */
 
 int test_htlc_commit_cpfp_anchor_present(void) {
@@ -618,17 +618,42 @@ int test_htlc_commit_cpfp_anchor_present(void) {
     for (int i = 0; i < 8; i++) to_remote_off |= ((uint64_t)tx0.data[90 + i]) << (i * 8);
     tx_buf_free(&tx0);
 
+    uint64_t to_local_off = 0;
+    {
+        tx_buf_t t; tx_buf_init(&t, 512);
+        ASSERT(channel_build_commitment_tx(&ch, &t, txid), "build (anchor off)");
+        for (int i = 0; i < 8; i++) to_local_off |= ((uint64_t)t.data[47 + i]) << (i * 8);
+        tx_buf_free(&t);
+    }
+
     /* Flag ON: 3 outputs; output[2] is the keyless P2A (240 sats); the 240-sat
-       cost comes out of to_remote so the output sum (hence the miner fee) and
-       to_local are unchanged. */
+       cost comes out of the funder's output, so the output sum (hence the
+       miner fee) is unchanged.  Remote funder (a member's own commitment):
+       to_remote pays it. */
     ch.use_cpfp_anchor = 1;
+    ch.funder_is_local = 0;
     tx_buf_t tx1; tx_buf_init(&tx1, 512);
     ASSERT(channel_build_commitment_tx(&ch, &tx1, txid), "build (anchor on)");
     ASSERT(tx1.data[46] == 3, "anchor on: 3 outputs (to_local, to_remote, P2A)");
     uint64_t to_remote_on = 0;
     for (int i = 0; i < 8; i++) to_remote_on |= ((uint64_t)tx1.data[90 + i]) << (i * 8);
     ASSERT(to_remote_on == to_remote_off - ANCHOR_OUTPUT_AMOUNT,
-           "anchor cost (240) deducted from to_remote");
+           "remote funder: anchor cost (240) deducted from to_remote");
+    /* Local funder (the LSP's own commitment): to_local pays it, the other
+       side's balance is untouched. */
+    {
+        ch.funder_is_local = 1;
+        tx_buf_t t; tx_buf_init(&t, 512);
+        ASSERT(channel_build_commitment_tx(&ch, &t, txid), "build (anchor on, local funder)");
+        uint64_t tl = 0, tr = 0;
+        for (int i = 0; i < 8; i++) tl |= ((uint64_t)t.data[47 + i]) << (i * 8);
+        for (int i = 0; i < 8; i++) tr |= ((uint64_t)t.data[90 + i]) << (i * 8);
+        ASSERT(tl == to_local_off - ANCHOR_OUTPUT_AMOUNT,
+               "local funder: anchor cost (240) deducted from to_local");
+        ASSERT(tr == to_remote_off, "local funder: to_remote untouched");
+        tx_buf_free(&t);
+        ch.funder_is_local = 0;
+    }
     /* output[2] (anchor) at offset 46+1+43+43 = 133. */
     uint64_t anchor_amt = 0;
     for (int i = 0; i < 8; i++) anchor_amt |= ((uint64_t)tx1.data[133 + i]) << (i * 8);

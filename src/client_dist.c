@@ -14,6 +14,7 @@
 #include <string.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern void reverse_bytes(unsigned char *data, size_t len);
 
 #define DIST_MAX_OUTPUTS 4096
 #define DIST_MAX_SPK     10000
@@ -480,4 +481,136 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
                 "confirm\n");
     client_dist_free(&d);
     return settles;
+}
+
+/* End-date payouts: from the end date on, publish the payout of every shared
+   output on this member's path that is on chain and unspent.  The tree being
+   partly or wholly on chain kills the distribution TX; these are then the
+   member's claim, with no message from the host.  Returns how many are in
+   the mempool or were sent now. */
+#define CLIENT_PAYOUT_MAX_ROWS 64
+int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
+                         client_dist_send_fn send, FILE *out) {
+    if (!db || !chain || !chain->get_block_height || !chain->is_outpoint_unspent) return 0;
+    int tip = chain->get_block_height(chain);
+    if (tip <= 0) return 0;
+    persist_payout_row_t rows[CLIENT_PAYOUT_MAX_ROWS];
+    size_t n = persist_load_payouts(db, factory_id, rows, CLIENT_PAYOUT_MAX_ROWS);
+    int sent = 0;
+    for (size_t i = 0; i < n; i++) {
+        if ((uint32_t)tip < rows[i].locktime) continue;   /* the next block is > tip */
+        if (chain->is_outpoint_unspent(chain, rows[i].prev_txid_hex, rows[i].prev_vout) != 1)
+            continue;
+        char *hex = malloc(rows[i].tx_len * 2 + 1);
+        if (!hex) continue;
+        hex_encode(rows[i].tx, rows[i].tx_len, hex);
+        char txid[65] = "";
+        int ok = send ? send(chain, hex, txid)
+                      : (chain->send_raw_tx && chain->send_raw_tx(chain, hex, txid));
+        free(hex);
+        if (out)
+            fprintf(out, "Client: end-date payout of %s:%u %s%s\n", rows[i].prev_txid_hex,
+                    rows[i].prev_vout, ok ? "broadcast: " : "not accepted", ok ? txid : "");
+        if (ok) sent++;
+    }
+    persist_free_payout_rows(rows, n);
+    return sent;
+}
+
+/* From the end date on, with the funding output spent: put this member's
+   pre-signed path on chain, one node a call, down to the first output on it
+   that has an end-date payout (client_payouts_claim then publishes that
+   payout, which pays every member below it).  Returns 1 if a node was sent
+   or is in the mempool, 0 if there is nothing to push now, -1 on error. */
+static void txid_hex_of(const unsigned char internal[32], char out[65]) {
+    unsigned char d[32];
+    memcpy(d, internal, 32);
+    reverse_bytes(d, 32);
+    hex_encode(d, 32, out);
+}
+
+static void path_wait(FILE *out, int node, const char *why) {
+    static int last_node = -2;
+    static const char *last_why;
+    if (!out || (node == last_node && why == last_why)) return;
+    last_node = node;
+    last_why = why;
+    fprintf(out, "Client: end-date exit: path node %d %s\n", node, why);
+    fflush(out);
+}
+
+int client_path_push(const factory_t *f, uint32_t participant, chain_backend_t *chain,
+                     client_dist_send_fn send, FILE *out) {
+    if (!f || participant == 0 || !chain || !chain->get_block_height ||
+        !chain->get_confirmations || !chain->is_outpoint_unspent)
+        return -1;
+    int tip = chain->get_block_height(chain);
+    if (tip <= 0) return -1;
+    if (f->cltv_timeout == 0 || (uint32_t)tip < f->cltv_timeout) return 0;
+    size_t leaf = 0;
+    uint32_t leaf_vout = 0;
+    int path[64];
+    size_t n = factory_client_to_leaf(f, participant - 1, &leaf, &leaf_vout)
+               ? factory_collect_path_to_root(f, (int)leaf, path, 64) : 0;
+    if (n == 0) return -1;
+    int parent_confs = -1;
+    {
+        char fh[65];
+        txid_hex_of(f->funding_txid, fh);
+        parent_confs = chain->get_confirmations(chain, fh);
+    }
+    for (size_t k = 0; k < n; k++) {
+        const factory_node_t *x = &f->nodes[path[k]];
+        char hex[65];
+        txid_hex_of(x->txid, hex);
+        int conf = chain->get_confirmations(chain, hex);
+        /* the output of this node on the member's path */
+        uint32_t ov = (k + 1 < n) ? (uint32_t)f->nodes[path[k + 1]].parent_vout : leaf_vout;
+        if (conf >= 1) {
+            if (factory_find_payout(f, (uint32_t)path[k], ov) >= 0) {
+                path_wait(out, path[k], "is on chain; its output on this member's path has a payout");
+                return 0;
+            }
+            parent_confs = conf;
+            continue;
+        }
+        if (chain->is_in_mempool && chain->is_in_mempool(chain, hex)) {
+            path_wait(out, path[k], "is in the mempool");
+            return 1;
+        }
+        /* the output this node spends: still there? (a payout or another
+           exit may have spent it, which settles this path) */
+        char pth[65];
+        uint32_t pv;
+        if (x->parent_index < 0) { txid_hex_of(f->funding_txid, pth); pv = f->funding_vout; }
+        else { txid_hex_of(f->nodes[x->parent_index].txid, pth); pv = x->parent_vout; }
+        if (parent_confs < 1 || chain->is_outpoint_unspent(chain, pth, pv) != 1) {
+            path_wait(out, path[k], "waits: the output it spends is not on chain or is spent");
+            return 0;
+        }
+        uint32_t ns = x->nsequence;
+        int lock = (!(ns & 0x80000000u) && !(ns & 0x00400000u)) ? (int)(ns & 0xFFFFu) : 0;
+        if (parent_confs < lock) {
+            path_wait(out, path[k], "waits for its relative lock");
+            return 0;
+        }
+        if (!x->is_signed || x->signed_tx.len == 0) {
+            path_wait(out, path[k], "is not signed in the stored factory");
+            return 0;
+        }
+        char *txh = malloc(x->signed_tx.len * 2 + 1);
+        if (!txh) return -1;
+        hex_encode(x->signed_tx.data, x->signed_tx.len, txh);
+        char sent[65] = "";
+        int ok = send ? send(chain, txh, sent)
+                      : (chain->send_raw_tx && chain->send_raw_tx(chain, txh, sent));
+        free(txh);
+        if (out) {
+            fprintf(out, "Client: end-date exit: path node %d %s%s\n", path[k],
+                    ok ? "broadcast " : "not accepted", ok ? sent : "");
+            fflush(out);
+        }
+        return ok ? 1 : 0;
+    }
+    return 0;
 }

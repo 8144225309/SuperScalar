@@ -1,4 +1,6 @@
 #include "superscalar/factory.h"
+#include "superscalar/tapscript.h"
+#include "superscalar/tx_builder.h"
 #include "superscalar/musig.h"
 #include "superscalar/shachain.h"
 #include "superscalar/channel.h"
@@ -11,6 +13,17 @@
 #include <stdlib.h>
 
 #include "superscalar/sha256.h"
+
+/* BIP-341 key-only output key: internal + H_TapTweak(internal) * G. */
+static int keyonly_tweak(const secp256k1_context *ctx, secp256k1_xonly_pubkey *out,
+                         const secp256k1_xonly_pubkey *internal) {
+    unsigned char ser[32], tw[32];
+    secp256k1_pubkey full;
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, internal)) return 0;
+    sha256_tagged("TapTweak", ser, 32, tw);
+    return secp256k1_xonly_pubkey_tweak_add(ctx, &full, internal, tw) &&
+           secp256k1_xonly_pubkey_from_pubkey(ctx, out, NULL, &full);
+}
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -2585,41 +2598,26 @@ int test_factory_arity1_client_to_leaf(void) {
 
 /* ---- Arity-1 Hardening Tests ---- */
 
-int test_factory_arity1_cltv_strict_ordering(void) {
+int test_factory_arity1_outputs_key_path_only(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
-    f->cltv_timeout = 200;  /* Enough room for 5 tiers of TIMEOUT_STEP_BLOCKS=5 */
+    f->cltv_timeout = 200;
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
-    /* Verify strict CLTV ordering: every child CLTV < parent CLTV.
-       DFS layout: kr=0, sr=1, kl=2, sl=3, ka=4, sa=5, kb=6, sb=7,
-                   kri=8, sri=9, kc=10, sc=11, kd=12, sd=13 */
-
-    /* Generic check: every node with a parent must have CLTV <= parent CLTV.
-       For non-root kickoffs and states with has_taptree, strictly less. */
+    /* Every tree output is key path only: the output a node spends is the
+       BIP-341 key-only P2TR of the node's own signers, whatever the CLTV. */
     for (size_t i = 0; i < f->n_nodes; i++) {
-        const factory_node_t *node = &f->nodes[i];
-        if (node->parent_index < 0) continue;
-        const factory_node_t *parent = &f->nodes[node->parent_index];
-        if (node->has_taptree && parent->has_taptree) {
-            TEST_ASSERT(node->cltv_timeout < parent->cltv_timeout,
-                        "child cltv < parent cltv");
-        }
+        secp256k1_xonly_pubkey k;
+        unsigned char spk[34];
+        TEST_ASSERT(keyonly_tweak(ctx, &k, &f->nodes[i].keyagg.agg_pubkey),
+                    "tweak node key");
+        build_p2tr_script_pubkey(spk, &k);
+        TEST_ASSERT(memcmp(spk, f->nodes[i].spending_spk, 34) == 0,
+                    "node input is key path only");
     }
-
-    /* Verify root state has the longest CLTV */
-    TEST_ASSERT_EQ(f->nodes[1].cltv_timeout, 200, "sr = 200");
-    /* Mid kickoff left (depth=1 ko): 200 - 1*5 = 195 */
-    TEST_ASSERT_EQ(f->nodes[2].cltv_timeout, 195, "kl = 195");
-    /* Mid state left (depth=1 st): 200 - 2*5 = 190 */
-    TEST_ASSERT_EQ(f->nodes[3].cltv_timeout, 190, "sl = 190");
-    /* Leaf kickoff A (depth=2 ko): 200 - 3*5 = 185 */
-    TEST_ASSERT_EQ(f->nodes[4].cltv_timeout, 185, "ka = 185");
-    /* Leaf state A (depth=2 st): 200 - 4*5 = 180 */
-    TEST_ASSERT_EQ(f->nodes[5].cltv_timeout, 180, "sa = 180");
 
     factory_free(f);
     secp256k1_context_destroy(ctx);
@@ -3002,14 +3000,15 @@ static int validate_tree_invariants(const factory_t *f) {
         if (out_total + node->fee_sats != node->input_amount) return 0;
     }
 
-    /* 5. CLTV monotonicity: child cltv < parent cltv (when both have taptree) */
+    /* 5. No script path on any tree output: each node's input is the
+       key-only P2TR of its signers. */
     for (size_t i = 0; i < f->n_nodes; i++) {
-        const factory_node_t *node = &f->nodes[i];
-        if (node->parent_index < 0) continue;
-        const factory_node_t *parent = &f->nodes[node->parent_index];
-        if (node->has_taptree && parent->has_taptree) {
-            if (node->cltv_timeout >= parent->cltv_timeout) return 0;
-        }
+        secp256k1_xonly_pubkey k;
+        unsigned char spk[34];
+        if (!keyonly_tweak(f->ctx, &k, &f->nodes[i].keyagg.agg_pubkey))
+            return 0;
+        build_p2tr_script_pubkey(spk, &k);
+        if (memcmp(spk, f->nodes[i].spending_spk, 34) != 0) return 0;
     }
 
     /* 6. Kickoff/state alternation: root pair + every ko→st link */
@@ -3844,119 +3843,6 @@ int test_factory_nav_variable_n(void) {
 }
 
 /* === Timeout-Spend API Tests === */
-
-int test_factory_timeout_spend_tx(void) {
-    secp256k1_context *ctx = test_ctx();
-    secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
-
-    unsigned char fund_spk[34];
-    secp256k1_xonly_pubkey fund_tweaked;
-    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
-
-    unsigned char fake_txid[32];
-    memset(fake_txid, 0xAA, 32);
-
-    factory_t *f = calloc(1, sizeof(factory_t));
-    if (!f) return 0;
-    factory_init(f, ctx, kps, 5, 2, 4);
-    f->cltv_timeout = 1000;
-    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(f), "build tree");
-    TEST_ASSERT(factory_sign_all(f), "sign all");
-
-    /* Find a leaf state node with has_taptree */
-    int target_idx = -1;
-    for (int i = 0; i < f->n_leaf_nodes; i++) {
-        int ni = (int)f->leaf_node_indices[i];
-        if (f->nodes[ni].has_taptree) {
-            target_idx = ni;
-            break;
-        }
-    }
-    TEST_ASSERT(target_idx >= 0, "found leaf with taptree");
-
-    /* Build destination SPK (just reuse fund_spk) */
-    tx_buf_t timeout_tx;
-    tx_buf_init(&timeout_tx, 512);
-
-    /* Parent of the leaf state is a kickoff node */
-    int parent_idx = f->nodes[target_idx].parent_index;
-    TEST_ASSERT(parent_idx >= 0, "leaf has parent");
-
-    int ok = factory_build_timeout_spend_tx(f,
-        f->nodes[parent_idx].txid, 0,
-        f->nodes[parent_idx].outputs[0].amount_sats,
-        target_idx, &kps[0],
-        fund_spk, 34, 500, &timeout_tx);
-    TEST_ASSERT(ok, "build timeout spend");
-    TEST_ASSERT(timeout_tx.len > 0, "timeout tx non-empty");
-
-    /* Verify nLockTime in the raw tx (last 4 bytes before witness) */
-    /* The tx should have at least a few hundred bytes */
-    TEST_ASSERT(timeout_tx.len > 100, "reasonable tx size");
-
-    tx_buf_free(&timeout_tx);
-    factory_free(f);
-    secp256k1_context_destroy(ctx);
-    free(f);
-    return 1;
-}
-
-int test_factory_timeout_spend_mid_node(void) {
-    secp256k1_context *ctx = test_ctx();
-    secp256k1_keypair kps[5];
-    make_keypairs(ctx, kps);
-
-    unsigned char fund_spk[34];
-    secp256k1_xonly_pubkey fund_tweaked;
-    compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked);
-
-    unsigned char fake_txid[32];
-    memset(fake_txid, 0xAA, 32);
-
-    factory_t *f = calloc(1, sizeof(factory_t));
-    if (!f) return 0;
-    factory_init(f, ctx, kps, 5, 2, 4);
-    f->cltv_timeout = 1000;
-    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
-    TEST_ASSERT(factory_build_tree(f), "build tree");
-    TEST_ASSERT(factory_sign_all(f), "sign all");
-
-    /* Find an intermediate kickoff node with has_taptree (not root, not leaf) */
-    /* In 5-participant arity-2: nodes 2 (ko_left) and 4 (ko_right) are intermediate kickoffs */
-    int target_idx = -1;
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        factory_node_t *n = &f->nodes[i];
-        if (n->type == NODE_KICKOFF && n->parent_index > 0 && n->has_taptree) {
-            target_idx = (int)i;
-            break;
-        }
-    }
-    TEST_ASSERT(target_idx >= 0, "found mid kickoff with taptree");
-
-    /* Parent of this kickoff is a state node */
-    int parent_idx = f->nodes[target_idx].parent_index;
-    TEST_ASSERT(parent_idx >= 0, "kickoff has parent");
-
-    tx_buf_t timeout_tx;
-    tx_buf_init(&timeout_tx, 512);
-    int ok = factory_build_timeout_spend_tx(f,
-        f->nodes[parent_idx].txid, f->nodes[target_idx].parent_vout,
-        f->nodes[parent_idx].outputs[f->nodes[target_idx].parent_vout].amount_sats,
-        target_idx, &kps[0],
-        fund_spk, 34, 500, &timeout_tx);
-    TEST_ASSERT(ok, "build mid timeout spend");
-    TEST_ASSERT(timeout_tx.len > 0, "mid timeout tx non-empty");
-
-    tx_buf_free(&timeout_tx);
-    factory_free(f);
-    secp256k1_context_destroy(ctx);
-    free(f);
-    return 1;
-}
-
-/* ---- Placement mode tests ---- */
 
 int test_placement_sequential(void) {
     secp256k1_context *ctx = test_ctx();

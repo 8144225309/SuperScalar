@@ -1050,7 +1050,17 @@ extern int test_tapscript_sighash(void);
 extern int test_revocation_checksig_leaf(void);
 extern int test_factory_tree_with_timeout(void);
 extern int test_multi_level_timeout_unit(void);
-extern int test_regtest_timeout_spend(void);
+extern int test_regtest_end_date_payout(void);
+extern int test_end_date_spend_rules_all_shapes(void);
+extern int test_end_date_member_refuses_missing_payouts(void);
+extern int test_end_date_member_waits_for_host_revocation(void);
+extern int test_end_date_update_needs_host_cosig(void);
+extern int test_end_date_revocation_wait_survives_restart(void);
+extern int test_end_date_refuses_missing_end_date(void);
+extern int test_end_date_anchor_from_funder_only(void);
+extern int test_end_date_nonce_refresh(void);
+extern int test_regtest_end_date_no_tree(void);
+extern int test_regtest_end_date_host_forced_exit(void);
 
 extern int test_shachain_generation(void);
 extern int test_shachain_derivation_property(void);
@@ -1779,8 +1789,6 @@ extern int test_factory_path_to_root(void);
 extern int test_factory_subtree_clients(void);
 extern int test_factory_find_leaf_for_client(void);
 extern int test_factory_nav_variable_n(void);
-extern int test_factory_timeout_spend_tx(void);
-extern int test_factory_timeout_spend_mid_node(void);
 
 /* Arity-1 tests */
 extern int test_factory_build_tree_arity1(void);
@@ -1791,7 +1799,7 @@ extern int test_factory_arity1_advance_leaf(void);
 extern int test_factory_arity1_leaf_independence(void);
 extern int test_factory_arity1_coop_close(void);
 extern int test_factory_arity1_client_to_leaf(void);
-extern int test_factory_arity1_cltv_strict_ordering(void);
+extern int test_factory_arity1_outputs_key_path_only(void);
 extern int test_factory_arity1_min_funding_reject(void);
 extern int test_factory_arity1_input_amounts_consistent(void);
 extern int test_factory_arity1_split_round_leaf_advance(void);
@@ -3256,6 +3264,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_revocation_checksig_leaf);
     RUN_TEST(test_factory_tree_with_timeout);
     RUN_TEST(test_multi_level_timeout_unit);
+    RUN_TEST(test_end_date_spend_rules_all_shapes);
+    RUN_TEST(test_end_date_member_refuses_missing_payouts);
+    RUN_TEST(test_end_date_member_waits_for_host_revocation);
+    RUN_TEST(test_end_date_update_needs_host_cosig);
+    RUN_TEST(test_end_date_revocation_wait_survives_restart);
+    RUN_TEST(test_end_date_refuses_missing_end_date);
+    RUN_TEST(test_end_date_anchor_from_funder_only);
+    RUN_TEST(test_end_date_nonce_refresh);
 
     printf("\n=== Shachain (Factory) ===\n");
     RUN_TEST(test_shachain_generation);
@@ -3891,8 +3907,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_subtree_clients);
     RUN_TEST(test_factory_find_leaf_for_client);
     RUN_TEST(test_factory_nav_variable_n);
-    RUN_TEST(test_factory_timeout_spend_tx);
-    RUN_TEST(test_factory_timeout_spend_mid_node);
 
     printf("\n=== Variable-N Tree ===\n");
     RUN_TEST(test_factory_build_tree_n3);
@@ -3914,7 +3928,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_arity1_client_to_leaf);
 
     printf("\n=== Arity-1 Hardening ===\n");
-    RUN_TEST(test_factory_arity1_cltv_strict_ordering);
+    RUN_TEST(test_factory_arity1_outputs_key_path_only);
     RUN_TEST(test_factory_arity1_min_funding_reject);
     RUN_TEST(test_factory_arity1_input_amounts_consistent);
     RUN_TEST(test_factory_arity1_split_round_leaf_advance);
@@ -4470,7 +4484,9 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_musig_onchain);
     RUN_TEST(test_regtest_nsequence_edge);
     RUN_TEST(test_regtest_factory_tree);
-    RUN_TEST(test_regtest_timeout_spend);
+    RUN_TEST(test_regtest_end_date_payout);
+    RUN_TEST(test_regtest_end_date_no_tree);
+    RUN_TEST(test_regtest_end_date_host_forced_exit);
     RUN_TEST(test_regtest_burn_tx);
     RUN_TEST(test_regtest_lstock_hashlock_poison);
     RUN_TEST(test_regtest_lstock_poison_ceremony);

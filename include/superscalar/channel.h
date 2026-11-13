@@ -20,6 +20,8 @@
 
 /* P2A (Pay-to-Anchor) scriptPubKey: OP_1 OP_PUSHBYTES_2 4e73 (anyone-can-spend) */
 #define P2A_SPK_LEN  4
+/* Largest LSP commitment kept signed (the HTLC output cap keeps it under). */
+#define CHANNEL_HOST_COMMIT_TX_MAX 12000
 static const unsigned char P2A_SPK[4] = {0x51, 0x02, 0x4e, 0x73};
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
@@ -160,12 +162,6 @@ typedef struct {
     unsigned char close_their_spk[34];  /* peer's scriptpubkey from shutdown */
     uint16_t      close_their_spk_len;
 
-    /* CLTV taptree merkle root for commitment signing.
-       Set when factory leaf output has a CLTV timeout script (cltv_timeout > 0).
-       Both sides must use the same root in musig_session_finalize_nonces. */
-    unsigned char chan_merkle_root[32];
-    int has_chan_merkle_root;
-
     /* Reorg resistance: highest height ever used for HTLC timeout check.
        Prevents premature HTLC failure when height goes backward during reorg. */
     uint32_t      last_htlc_check_height;
@@ -208,6 +204,24 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+    /* Commitment number latest_commitment_sig is for.  The LSP holds one
+       too: each member co-signs the LSP's own commitment with every
+       REVOKE_AND_ACK, so the LSP can close the channel without the member
+       before the end date (its forced exit). */
+    uint64_t      latest_commitment_sig_cn;
+    /* LSP side: its own latest commitment the member co-signed, fully
+       signed (the transaction its forced exit publishes), with its txid
+       (internal order).  It is replaced only by a newer co-signed one, and
+       the LSP revokes the older one only after that, so the one held is
+       never revoked. */
+    unsigned char host_commit_tx[CHANNEL_HOST_COMMIT_TX_MAX];
+    size_t        host_commit_tx_len;
+    unsigned char host_commit_txid[32];
+    /* LSP side: an update came back without a valid co-signature of the
+       LSP's commitment (or none arrived at open).  The channel takes no
+       further update; it is closed with the commitment the LSP holds in the
+       forced-exit window, or settled by the end-date payouts. */
+    int           host_commit_refused;
 
     /* The HTLC this side offered last, for as long as no commitment that
        contains it has been accepted from the peer.  Only such an HTLC can be
@@ -256,12 +270,6 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
 
 void channel_cleanup(channel_t *ch);
 
-/* Set the CLTV taptree merkle root used for commitment signing.
-   Must be called after channel_init when the factory has cltv_timeout > 0.
-   lsp_pubkey: the LSP's funding pubkey (participant 0 in factory keyagg). */
-void channel_set_cltv_merkle_root(channel_t *ch, uint32_t cltv_timeout,
-                                   const secp256k1_pubkey *lsp_pubkey);
-
 int channel_set_local_basepoints(channel_t *ch,
                                    const unsigned char *payment_secret32,
                                    const unsigned char *delayed_payment_secret32,
@@ -309,6 +317,8 @@ int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_nu
                                      const unsigned char *secret32);
 
 /* Store a received revocation secret at flat index. */
+/* Grow the received-revocation arrays to hold n numbers. */
+int channel_ensure_revocations_cap(channel_t *ch, size_t n);
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
                                       const unsigned char *secret32);
 
@@ -433,29 +443,17 @@ void channel_update_funding(channel_t *ch,
                               const unsigned char *new_funding_spk,
                               size_t new_funding_spk_len);
 
-/* SF-CH #154: discover the correct 2-party funding keyagg ordering by
-   reproducing the factory's P2TR construction.  Tries both [my, peer] and
-   [peer, my] orderings, each against both factory_cltv and node_cltv (since
-   non-PS leaves use the factory base while PS leaves use the depth-adjusted
-   node value).  On match, sets *keyagg, *my_signer_idx (0 if "my" is at
-   index 0, 1 if "my" is at index 1), and *merkle_root if cltv > 0.  Returns
-   1 on match, 0 if no combination matches funding_spk.
-
-   Caller perspective: pass YOUR pubkey as my_pubkey; the returned
-   my_signer_idx tells you where your key sits in the keyagg ordering. */
+/* SF-CH #154: find the key order of a channel output, the key-path-only
+   P2TR of MuSig2(member, LSP).  On match sets *keyagg and *my_signer_idx (0 if
+   "my" key is first, 1 if second) and returns 1; 0 if neither order matches. */
 int channel_discover_funding_keyagg(
     const secp256k1_context *ctx,
     const secp256k1_pubkey *my_pubkey,
     const secp256k1_pubkey *peer_pubkey,
-    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
-    uint32_t factory_cltv,
-    uint32_t node_cltv,
     const unsigned char *funding_spk,
     size_t funding_spk_len,
     musig_keyagg_t *keyagg_out,
-    uint32_t *my_signer_idx_out,
-    unsigned char *merkle_root_out32,
-    int *has_merkle_root_out);
+    uint32_t *my_signer_idx_out);
 
 /* --- Random bytes utility --- */
 

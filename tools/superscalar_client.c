@@ -1000,11 +1000,78 @@ static int client_dist_send_cpfp(chain_backend_t *chain, const char *tx_hex,
     return cpfp_send_default(chain, tx_hex, txid_out) != CPFP_FAILED;
 }
 
+/* This member's public key, for finding its slot in the stored factory. */
+static secp256k1_pubkey g_dist_my_pubkey;
+static int g_dist_my_pubkey_set;
+
+/* The stored factory, loaded once the member needs its path on chain. */
+static factory_t *g_exit_factory;
+static uint32_t g_exit_participant;
+
+static void client_exit_factory_load(persist_t *db, secp256k1_context *ctx) {
+    if (g_exit_factory || !g_dist_my_pubkey_set) return;
+    static int reported;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return;
+    if (!persist_load_factory(db, 0, f, ctx)) {
+        if (!reported++)
+            fprintf(stderr, "Client: cannot load the stored factory for the end-date "
+                    "exit; only stored payouts are published\n");
+        free(f);
+        return;
+    }
+    unsigned char me[33], pk[33];
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, me, &l, &g_dist_my_pubkey, SECP256K1_EC_COMPRESSED);
+    for (size_t i = 1; i < f->n_participants; i++) {
+        l = 33;
+        secp256k1_ec_pubkey_serialize(ctx, pk, &l, &f->pubkeys[i], SECP256K1_EC_COMPRESSED);
+        if (memcmp(me, pk, 33) == 0) { g_exit_participant = (uint32_t)i; break; }
+    }
+    /* the signed bytes of every node (persist_load_factory verified them) */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *x = &f->nodes[i];
+        if (x->is_signed && x->signed_tx.len > 0) continue;
+        tx_buf_t t;
+        memset(&t, 0, sizeof(t));
+        if (persist_load_tree_node_signed_tx(db, 0, (uint32_t)i, &t)) {
+            tx_buf_free(&x->signed_tx);
+            x->signed_tx = t;
+            x->is_signed = 1;
+        }
+    }
+    if (g_exit_participant == 0) {
+        if (!reported++)
+            fprintf(stderr, "Client: this member is not in the stored factory; no "
+                    "end-date path to publish\n");
+        factory_free(f);
+        free(f);
+        return;
+    }
+    g_exit_factory = f;
+}
+
 static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
                                              secp256k1_context *ctx) {
     if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
-    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, client_dist_send_cpfp,
-                             10, stdout);
+    client_dist_status_t s = client_dist_watch(&g_dist_watch, db, ctx, wt->chain,
+                                               client_dist_send_cpfp, 10, stdout);
+    /* From the end date on with the funding output spent (the tree is partly
+       on chain, so the distribution TX cannot confirm): put this member's
+       pre-signed path on chain down to the first output with an end-date
+       payout, and publish the payout of each shared output on its path that
+       is unspent.  Checked every 10 s, so the payout goes out right at the
+       end date; no message from the LSP is needed. */
+    static time_t last_payout_check;
+    if (s == CLIENT_DIST_FUNDING_SPENT && time(NULL) - last_payout_check >= 10) {
+        last_payout_check = time(NULL);
+        client_exit_factory_load(db, ctx);
+        if (g_exit_factory)
+            client_path_push(g_exit_factory, g_exit_participant, wt->chain,
+                             client_dist_send_cpfp, stdout);
+        client_payouts_claim(db, wt->chain, 0, client_dist_send_cpfp, stdout);
+    }
+    return s;
 }
 
 static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
@@ -1040,7 +1107,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
                 persist_save_tree_nodes(cbd->db, factory, 0) &&
-                client_persist_commitment_sig(ch, cbd)) {
+                client_persist_commitment_sig(ch, cbd) &&
+                /* The end-date payouts on this member's path, with the tree:
+                   the member never holds a tree without its claim at T0. */
+                persist_save_payouts(cbd->db, 0, factory, my_index)) {
                 /* Save the verified signed distribution TX */
                 if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
                     persist_save_distribution_tx(cbd->db, 0,
@@ -2077,6 +2147,14 @@ handle_message:
         }
 
         case MSG_CHANNEL_NONCES: {
+            /* Fresh signing nonces for the factory channel, between updates. */
+            if (msg.json && cJSON_IsTrue(cJSON_GetObjectItem(msg.json, "refresh"))) {
+                if (client_handle_nonce_refresh(fd, ch, ctx, &msg))
+                    printf("Client %u: fresh signing nonces (%zu)\n", my_index,
+                           ch->remote_nonce_count);
+                cJSON_Delete(msg.json);
+                break;
+            }
             /* JIT nonce exchange (non-blocking) */
             if (cbd->jit_phase != JIT_PHASE_WAITING_NONCES) {
                 fprintf(stderr, "Client %u: unexpected CHANNEL_NONCES "
@@ -2253,6 +2331,7 @@ handle_message:
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0) &&
                         client_persist_commitment_sig(ch, cbd) &&
+                        persist_save_payouts(cbd->db, 0, factory, my_index) &&
                         persist_delete_factory_record(cbd->db,
                             CLIENT_ROTATION_PENDING_FACTORY_ID)) {
                         int rot_ok = 1;
@@ -4044,6 +4123,7 @@ int main(int argc, char *argv[]) {
         report_close(&rpt);
         return 1;
     }
+    g_dist_my_pubkey_set = secp256k1_keypair_pub(ctx, &g_dist_my_pubkey, &kp);
 
     /* Where to connect, and which key authenticates the LSP.  With --lsp the
        well-known endpoint supplies the host and port.  Its response travels

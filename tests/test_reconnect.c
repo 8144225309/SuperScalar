@@ -2783,15 +2783,18 @@ static void child_reconnect_pending_cs(int fd, int client_idx,
     _exit(acked == (expect_ack != 0) ? 0 : 6);
 }
 
-/* A commitment pending at reconnect is settled by the client's valid
-   revocation only; anything else refuses the reconnect, disconnects the
-   client and keeps the commitment pending. */
+/* A commitment pending at reconnect is settled only by the client's valid
+   revocation carrying its signature over the LSP's commitment at the same
+   number; anything else (here: a bad secret, another message, an
+   unparseable one, a valid secret without that signature) refuses the
+   reconnect, disconnects the client and keeps the commitment pending. */
 int test_reconnect_pending_commitment_needs_revocation(void) {
     unsigned char good[32], bad[32];
     memset(good, 0x41, 32);
     memset(bad, 0x42, 32);
 
-    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret */
+    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret
+       without the co-signature of the LSP's commitment */
     for (int round = 0; round < 4; round++) {
         secp256k1_context *ctx;
         unsigned char lsp_sec[32];
@@ -2851,7 +2854,7 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
         if (pid == 0) {
             close(sv[0]);
             if (round == 3)
-                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 1);
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 0);
             else
                 child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2],
                                            round, bad, 0);
@@ -2869,10 +2872,11 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
         TEST_ASSERT_EQ(child_rc, 0, "client saw what it should");
 
         if (round == 3) {
-            TEST_ASSERT_EQ(ok, 1, "valid revocation: reconnect accepted");
-            TEST_ASSERT(!has_pending, "commitment no longer pending");
-            TEST_ASSERT(lsp->client_fds[2] == sv[0], "client connected");
-            TEST_ASSERT(lsp_channels_peer_revoked(ch), "revocation stored");
+            TEST_ASSERT_EQ(ok, 0, "no co-signature: reconnect refused");
+            TEST_ASSERT(has_pending, "commitment still pending");
+            TEST_ASSERT_EQ(lsp->client_fds[2], -1, "client disconnected");
+            TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing stored");
+            TEST_ASSERT(ch->host_commit_refused, "the channel takes no further update");
         } else {
             TEST_ASSERT_EQ(ok, 0, "reconnect refused");
             TEST_ASSERT(has_pending, "commitment still pending");

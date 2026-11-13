@@ -83,28 +83,29 @@ int cli_validate_shape_for_bolt2016(
 int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
                                     char *err_buf, size_t err_buf_len);
 
-/* Blocks a member's unilateral exit can need, worst case, counted from the
-   factory's creation: the builder's early-warning time (every DW layer at
-   its first state, factory_compute_ewt_for_shape), one block per transaction
-   on the deepest path (a kickoff and a state per depth, and the commitment),
-   and the staggering of the tree's timeout paths, which open
-   2 * CLI_FACTORY_TIMEOUT_STEP blocks earlier per depth.  The depth is
-   bounded by ceil(log2(n_clients)) + 1: every split has at least two parts. */
+/* Blocks a unilateral exit of one member's channel can need, worst case:
+   the builder's early-warning time (every DW layer at its first state,
+   factory_compute_ewt_for_shape) and one block per transaction on the
+   deepest path (a kickoff and a state per depth, and the commitment).  The
+   depth is bounded by ceil(log2(n_clients)) + 1: every split has at least
+   two parts.  It is both a member's exit and the LSP's forced exit of a
+   member. */
 uint32_t cli_factory_exit_blocks(const uint8_t *level_arities, size_t n_level_arity,
                                  factory_arity_t leaf_arity,
                                  uint32_t ps_subfactory_arity, size_t n_clients,
                                  uint32_t static_threshold, uint16_t step_blocks,
                                  uint32_t states_per_layer);
 
-#define CLI_FACTORY_TIMEOUT_STEP 5u  /* TIMEOUT_STEP_BLOCKS in factory.c */
 #define CLI_FACTORY_CLTV_MARGIN  6u  /* blocks of slack on top of the exit */
 #define CLI_FACTORY_TIP_SKEW     6u  /* LSP auto timeout: members' tips may be ahead */
 
-/* Factory expiry floor (LSP).  From cltv_timeout on the distribution TX is
-   valid and the LSP's timeout paths in the tree are open, so a factory
-   created at block `created` needs cltv_timeout at or after its EXPIRED
-   block (created + active_blocks + dying_blocks) and later than
-   created + exit_blocks + CLI_FACTORY_CLTV_MARGIN.  Returns 1 if both hold;
+/* The factory's one end date T0 = cltv_timeout (LSP).  From T0 on, every
+   end-date payout (the distribution TX and the payout of each shared tree
+   output) is valid and pays the members; the LSP has no path of its own.
+   The LSP pushes a silent member on chain before T0, after the factory has
+   expired: so T0 must be at least the EXPIRED block
+   (created + active_blocks + dying_blocks) plus a forced exit
+   (exit_blocks) plus CLI_FACTORY_CLTV_MARGIN.  Returns 1 if it holds;
    otherwise writes an error to err_buf and returns 0. */
 int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t created,
                               uint32_t active_blocks, uint32_t dying_blocks,
@@ -119,10 +120,15 @@ int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
                                uint32_t exit_blocks,
                                char *err_buf, size_t err_buf_len);
 
-/* The automatic timeout offset: base_offset (the lifetime-derived default),
-   raised to exit_blocks + CLI_FACTORY_CLTV_MARGIN + CLI_FACTORY_TIP_SKEW + 1
-   when that is larger, so members whose tip is a few blocks ahead accept it. */
+/* The automatic timeout offset from creation: base_offset (the lifetime)
+   plus the forced-exit window exit_blocks + CLI_FACTORY_CLTV_MARGIN, plus
+   CLI_FACTORY_TIP_SKEW so members whose tip is a few blocks ahead accept it. */
 uint32_t cli_factory_auto_cltv_offset(uint32_t base_offset, uint32_t exit_blocks);
+
+/* The height from which the LSP pushes every member it has not closed with
+   on chain: T0 - exit_blocks - CLI_FACTORY_CLTV_MARGIN, so the last
+   commitment confirms before the end-date payouts are valid. */
+uint32_t cli_factory_force_exit_height(uint32_t cltv_timeout, uint32_t exit_blocks);
 
 #ifdef __cplusplus
 }

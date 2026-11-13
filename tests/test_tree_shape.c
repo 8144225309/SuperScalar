@@ -248,28 +248,30 @@ static uint32_t ts_shape_ewt(const ts_shape_t *s) {
    their tree txids.  Computed under the agreed-rate fee model: every tree tx
    nVersion 3, paying FACTORY_DEFAULT_TREE_FEE_RATE (100 sat/kvB) for its exact
    signed vsize, with the P2A anchor (240 sat) where the shape enables anchors.
+   No tree or channel output carries a script path, so the CLTV of a shape
+   appears only in its end-date payouts, never in a tree txid.
    Any change here changes a pre-signed tree. */
 static const struct { ts_shape_t s; const char *digest; } ts_pinned[] = {
     { { "N=4 arity 2", 4, {2}, 1, 0, 0, 0, 0, 0 },
       "d23da2e91ef537a7b35e4c447652552342c9e8b4a7ec880fea0101ac0515b464" },
     { { "N=4 arity 2 anchors cltv", 4, {2}, 1, 0, 1, 1000, 0, 0 },
-      "8f242297bc0b62043af73db843273e16b9e13318ed5cec5c3b744ed94f146230" },
+      "48b72bbe578b66a6bed10ae493d40ae36c294e5f330de070caf248a3c7a304e9" },
     { { "N=4 arity 1", 4, {1}, 1, 0, 0, 0, 0, 0 },
       "4dff4366b9afad6d57e2341dd23412641a7bbe9fc06d4075962972b1b2a8f38e" },
     { { "N=16 PS", 16, {3}, 1, 0, 0, 0, 0, 0 },
       "ebc52fd824db50215db6332c47bca7496dfdb9481791f8ac0965d08dd4da07a7" },
     { { "N=16 PS anchors cltv", 16, {3}, 1, 0, 1, 1000, 0, 0 },
-      "4af71776ddc349ac6a54f2f266e9b9c51faa2b3fb54863184cced4a0fb71a8a4" },
+      "3261c63f7ecd972e388408679a9017d860b3ff6f016be95a5543e6b6626fc7b3" },
     { { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 },
-      "6f6095ac538f88d593cfee9bf5657e502e41e10e87a257551cdf78827a97400b" },
+      "179fb61e899173a6894eb84c17ce2ece6bb36a73ea443f0933d86f1c8baf08fd" },
     { { "N=64 8,7,3 static 2", 64, {8, 7, 3}, 3, 2, 0, 0, 0, 0 },
       "394fa378c1f282c51dbab717b4204e676b0992a2820b0df56ea61bd73a9585b0" },
     { { "N=64 8,7,3 static 2 anchors", 64, {8, 7, 3}, 3, 2, 1, 1000, 0, 0 },
-      "7f1b7bbd27a2d324b791d80cb5844033ae60a1133725f2fc5ee6e24d45b00008" },
+      "9abfc7a4e0d6a323556e34442f8cf1513e06f7a7946fff6682ef4edee3cf7a50" },
     { { "N=128 2,4,8 static 2", 128, {2, 4, 8}, 3, 2, 0, 0, 0, 0 },
       "460c8bc7e7a5effe6ff1cae9d21a0f4d1af7f6c485aa0fe8674d49a92512ff8b" },
     { { "N=7 3,4 static 1", 7, {3, 4}, 2, 1, 1, 1000, 0, 0 },
-      "00555e2b7b4a6ce3a48b050dfc70cfee66344eedf03947c1155b808625dfc1bc" },
+      "555707cbc1a2ad6c737aae909043ba080cf559a76096a821c94d00d881fb4b17" },
     { { "N=12 2,4 static 1", 12, {2, 4}, 2, 1, 0, 0, 0, 0 },
       "53a1541b5d3d001c461ba27c9411f6701b800ab1901e5e0bc2bf84ef479045b1" },
     { { "N=12 timezone ties", 12, {2}, 1, 0, 0, 0, 0, 1 },
@@ -277,9 +279,9 @@ static const struct { ts_shape_t s; const char *digest; } ts_pinned[] = {
     { { "N=257 factory_init default", 257, {0}, 0, 0, 0, 0, 0, 0 },
       "83d4d16fbe7b54b9ed8a0d8072d6d0aa0acf3360f64d0902f75f4d36c8b83eeb" },
     { { "N=300 PS", 300, {3}, 1, 0, 1, 1000, 0, 0 },
-      "5f61855510cda94e6e0a976d9f30160c199f184878eb49fe9f2e125cfb75bc42" },
+      "fa117861ae08852e4c7ad3ffff2202f62950f62aabf5553a884d5634d16f7848" },
     { { "N=300 arity 2", 300, {2}, 1, 0, 1, 1000, 0, 0 },
-      "46cb60f975bd6f2df18b998a24cb6bfe9297b56a948630ef42b98c2c7afc1360" },
+      "ef78eb0065a925f385d8f4a62dc65c7c08eb61c4f14862a2297f88a1d21c637f" },
 };
 
 int test_tree_shape_txids_pinned(void) {
@@ -949,7 +951,8 @@ int test_tree_shape_channel_spk_default(void) {
         TEST_ASSERT(ts_open_b(&t, &ts_pinned[i].s, 0), "setup");
         TEST_ASSERT(t.f->chan_spks == NULL, "no channel scripts by default");
         unsigned char spk[34];
-        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        secp256k1_pubkey lm[2] = { t.f->pubkeys[0], t.f->pubkeys[1] };
+        TEST_ASSERT(ts_keypath_spk(t.ctx, lm, 2, spk), "script");
         TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, spk, 34), "set");
         TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, NULL, 0), "clear");
         char hex[65];
@@ -971,8 +974,12 @@ int test_tree_shape_channel_spk_default(void) {
     ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
     ts_tree_t t;
     TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
-    unsigned char spk[34], bad_spk[34];
-    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+    unsigned char spk[34], bad_spk[34], foreign[34];
+    secp256k1_pubkey lm[2] = { t.f->pubkeys[0], t.f->pubkeys[1] };
+    TEST_ASSERT(ts_keypath_spk(t.ctx, lm, 2, spk), "script");
+    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, foreign), "foreign script");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, foreign, 34),
+                "a key the member and the LSP cannot co-sign is refused");
     unsigned char p2wsh[34] = { 0x00, 0x20 };
     TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, p2wsh, 34), "P2WSH refused");
     memcpy(bad_spk, spk, 34); bad_spk[1] = 0x21;
@@ -1018,7 +1025,8 @@ int test_tree_shape_channel_spk_verbatim(void) {
         TEST_ASSERT(ts_open(&ref, s) && ref.built, s->name);
         TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
         unsigned char spk[34];
-        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        secp256k1_pubkey lm[2] = { t.f->pubkeys[0], t.f->pubkeys[2] };
+        TEST_ASSERT(ts_keypath_spk(t.ctx, lm, 2, spk), "script");
         TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 2, spk, 34), "set member 2");
         TEST_ASSERT(factory_build_tree(t.f), s->name);
         for (size_t c = 0; c < s->n_clients; c++) {
@@ -1091,8 +1099,8 @@ int test_tree_shape_channel_spk_verbatim(void) {
     TEST_ASSERT(ts_open_b(&t, &ps, 0), "PS setup");
     unsigned char foreign[34];
     TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, foreign), "script");
-    TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 3, foreign, 34), "set");
-    TEST_ASSERT(!factory_build_tree(t.f), "PS refuses a foreign channel key");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 3, foreign, 34),
+                "PS refuses a foreign channel key");
     ts_close(&t);
     ts_shape_t psk = { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 };
     TEST_ASSERT(ts_open_b(&t, &psk, 0), "PS k=2 setup");
@@ -1361,7 +1369,7 @@ static int ts_terms_factory(ts_tree_t *t, persist_t *db) {
     if (!ts_open_b(t, &s, 0)) return 0;
     factory_t *f = t->f;
     unsigned char spk[34];
-    secp256k1_pubkey o[2] = { f->pubkeys[0], f->pubkeys[2] };
+    secp256k1_pubkey o[2] = { f->pubkeys[2], f->pubkeys[0] };
     return ts_keypath_spk(t->ctx, o, 2, spk) &&
            factory_set_leaf_channel_spk(f, 2, spk, 34) &&
            ts_set_caps(f, 25000) &&

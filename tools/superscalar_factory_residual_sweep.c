@@ -7,8 +7,8 @@
  *
  * We hold every participant's seckey (test factories), so each N-of-N / 2-of-2
  * key-path is signable offline.  The merkle/taptweak per output type:
- *   - node funding (sub spending_spk): keyagg = node signers, merkle = node->merkle_root
- *   - channel output i               : keyagg = [client_i, LSP], merkle = factory-CLTV leaf
+ *   - node funding (sub spending_spk): keyagg = node signers, no merkle
+ *   - channel output i               : keyagg = [client_i, LSP], no merkle
  *   - L-stock (last output)          : keyagg = node signers, merkle = L-stock taptree
  * The reconstructed SPK is ASSERTED == the on-chain SPK BEFORE signing, so a
  * wrong key/merkle/funding-order fails safe (no wasted fee), never a bad sig.
@@ -58,8 +58,7 @@ static int match_output(const factory_t *f, const unsigned char *spk34,
         if (n->spending_spk_len == 34 && memcmp(spk34, n->spending_spk, 34) == 0) {
             memcpy(signers_out, n->signer_indices, n->n_signers * sizeof(uint32_t));
             *n_signers_out = n->n_signers;
-            if (n->has_taptree) { memcpy(merkle_out, n->merkle_root, 32); *has_merkle_out = 1; }
-            else *has_merkle_out = 0;
+            *has_merkle_out = 0;   /* tree outputs are key path only */
             snprintf(what, whatcap, "node %zu funding (n_signers=%zu)", ni, n->n_signers);
             return 1;
         }
@@ -78,18 +77,11 @@ static int match_output(const factory_t *f, const unsigned char *spk34,
                 *has_merkle_out = 1;
                 snprintf(what, whatcap, "node %zu L-stock", ni);
             } else {
-                /* channel v: keyagg = [client_v, LSP], merkle = factory CLTV leaf */
+                /* channel v: keyagg = [client_v, LSP], key path only */
                 signers_out[0] = n->signer_indices[1 + v];
                 signers_out[1] = n->signer_indices[0];
                 *n_signers_out = 2;
-                if (f->cltv_timeout > 0) {
-                    secp256k1_xonly_pubkey lsp_xonly;
-                    tapscript_leaf_t cltv_leaf;
-                    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) ||
-                        !tapscript_build_cltv_timeout(&cltv_leaf, f->cltv_timeout, &lsp_xonly, f->ctx) ||
-                        !tapscript_merkle_root(merkle_out, &cltv_leaf, 1)) return -1;
-                    *has_merkle_out = 1;
-                } else *has_merkle_out = 0;
+                *has_merkle_out = 0;
                 snprintf(what, whatcap, "node %zu channel vout %zu", ni, v);
             }
             return 1;

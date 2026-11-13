@@ -60,6 +60,20 @@ uint32_t client_chain_tip(void) {
            ? g_client_chain_tip_fn(g_client_chain_tip_ctx) : 0;
 }
 
+/* The proposed end date must be past this member's exit from the proposed
+   tree, judged by the member's own chain tip.  A member with a chain view
+   that cannot read its tip refuses: the end date cannot be checked. */
+static int client_check_proposed_cltv(uint32_t cltv_timeout, uint32_t exit_blocks,
+                                      char *err, size_t err_len) {
+    uint32_t tip = client_chain_tip();
+    if (g_client_chain_tip_fn && tip == 0) {
+        snprintf(err, err_len, "the chain tip is not known, so the factory CLTV "
+                 "timeout %u cannot be checked", (unsigned)cltv_timeout);
+        return 0;
+    }
+    return cli_validate_proposed_cltv(cltv_timeout, tip, exit_blocks, err, err_len);
+}
+
 static unsigned g_client_chain_tip_attempts = CLIENT_CHAIN_TIP_ATTEMPTS;
 static unsigned g_client_chain_tip_retry_ms = CLIENT_CHAIN_TIP_RETRY_MS;
 
@@ -528,29 +542,20 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     {
         musig_keyagg_t ka;
         uint32_t signer_idx;
-        unsigned char merkle[32];
-        int has_merkle = 0;
         if (!channel_discover_funding_keyagg(
-                ctx, &my_pubkey, lsp_pubkey, lsp_pubkey,
-                factory->cltv_timeout, state_node->cltv_timeout,
+                ctx, &my_pubkey, lsp_pubkey,
                 funding_spk, funding_spk_len,
-                &ka, &signer_idx, merkle, &has_merkle)) {
+                &ka, &signer_idx)) {
             fprintf(stderr,
-                    "Client %u: funding_keyagg discovery failed for channel "
-                    "(factory_cltv=%u, node_cltv=%u). Refusing to set up "
+                    "Client %u: funding_keyagg discovery failed: neither key "
+                    "order gives the channel output. Refusing to set up "
                     "channel — on-chain spends would fail Schnorr verify.\n",
-                    my_index, factory->cltv_timeout, state_node->cltv_timeout);
+                    my_index);
             memset(my_seckey, 0, 32);
             return 0;
         }
         ch->funding_keyagg = ka;
         ch->local_funding_signer_idx = signer_idx;
-        if (has_merkle) {
-            memcpy(ch->chan_merkle_root, merkle, 32);
-            ch->has_chan_merkle_root = 1;
-        } else {
-            ch->has_chan_merkle_root = 0;
-        }
     }
 
     memset(my_seckey, 0, 32);
@@ -575,6 +580,56 @@ int client_send_payment(int fd, channel_t *ch, uint64_t amount_sats,
     int ok = wire_send(fd, MSG_UPDATE_ADD_HTLC, msg);
     cJSON_Delete(msg);
     return ok;
+}
+
+/* Co-sign the LSP's own commitment at ch's current number and attach the
+   partial signature to msg (host_commit_psig, host_commit_nonce_index).  The
+   LSP's commitment has the same balances as the member's commitment the LSP
+   has just signed; its to-local output is delayed and revocable by this
+   member, and the LSP's earlier commitments are revoked as usual.  With it
+   the LSP can close the channel without the member before the end date.
+   Returns 1 if attached. */
+int client_add_host_commit_sig(channel_t *ch, cJSON *msg) {
+    unsigned char psig[32];
+    uint32_t nidx = 0;
+    if (!ch || !msg || !channel_create_commitment_partial_sig(ch, psig, &nidx)) {
+        fprintf(stderr, "Client: could not co-sign the LSP's commitment %llu\n",
+                ch ? (unsigned long long)ch->commitment_number : 0ULL);
+        return 0;
+    }
+    wire_json_add_hex(msg, "host_commit_psig", psig, 32);
+    cJSON_AddNumberToObject(msg, "host_commit_nonce_index", (double)nidx);
+    return 1;
+}
+
+/* 1 if every LSP commitment below the member's current one is revoked (the
+   LSP's revocation secret received and verified).  The member co-signs the
+   LSP's commitment at every number, from the channel open on, so each one
+   below the current number must be revoked: an LSP holding an unrevoked
+   older commitment could publish it after this member released a preimage.
+   The secrets are on disk (revocation_secrets) and restored with the channel
+   (client_restore_host_revocations), so the rule holds across a restart or
+   a reconnect. */
+int client_host_old_commitments_revoked(const channel_t *ch) {
+    if (!ch) return 1;
+    unsigned char s[32];
+    for (uint64_t cn = 0; cn < ch->commitment_number; cn++) {
+        if (!channel_get_received_revocation(ch, cn, s)) return 0;
+    }
+    return 1;
+}
+
+int client_restore_host_revocations(channel_t *ch, persist_t *db, uint32_t channel_id) {
+    if (!ch || !db) return 0;
+    /* revocations received from here on are stored too */
+    channel_set_persist(ch, db, channel_id);
+    if (!channel_ensure_revocations_cap(ch, (size_t)ch->commitment_number + 1)) return 0;
+    size_t n = 0;
+    if (!persist_load_revocations_flat(db, channel_id, ch->received_revocations,
+                                       ch->received_revocation_valid,
+                                       ch->revocations_cap, &n))
+        return 0;
+    return 1;
 }
 
 int client_handle_commitment_signed(int fd, channel_t *ch,
@@ -623,12 +678,51 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp);
 
     cJSON *ack = wire_build_revoke_and_ack(channel_id, rev_secret, ctx, &next_pcp);
+    /* The revocation goes only with this member's signature over the LSP's
+       commitment at the same number: without it the update fails here, and
+       the member's previous commitment stays unrevoked. */
+    if (!client_add_host_commit_sig(ch, ack)) {
+        cJSON_Delete(ack);
+        memset(rev_secret, 0, 32);
+        fprintf(stderr, "Client: failing the update to commitment %llu: no signature "
+                "over the LSP's commitment, so no revocation is sent\n",
+                (unsigned long long)ch->commitment_number);
+        client_send_error(fd, "update failed: cannot co-sign the LSP commitment");
+        return 0;
+    }
     int ok = wire_send(fd, MSG_REVOKE_AND_ACK, ack);
     cJSON_Delete(ack);
     memset(rev_secret, 0, 32);
     if (!ok)
         fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
                 (unsigned long long)ch->commitment_number);
+    return ok;
+}
+
+int client_handle_nonce_refresh(int fd, channel_t *ch, secp256k1_context *ctx,
+                                const wire_msg_t *msg) {
+    if (!ch || !ctx || !msg || !msg->json) return 0;
+    unsigned char (*lsp_nonces)[66] = calloc(MUSIG_NONCE_POOL_MAX, 66);
+    if (!lsp_nonces) return 0;
+    uint32_t cid = 0;
+    size_t n = 0;
+    int ok = wire_parse_channel_nonces(msg->json, &cid, lsp_nonces, MUSIG_NONCE_POOL_MAX, &n) &&
+             n > 0 && channel_init_nonce_pool(ch, n);
+    if (ok) {
+        size_t mine = ch->local_nonce_pool.count;
+        unsigned char (*pn)[66] = calloc(mine ? mine : 1, 66);
+        ok = pn != NULL;
+        for (size_t i = 0; ok && i < mine; i++)
+            musig_pubnonce_serialize(ctx, pn[i], &ch->local_nonce_pool.nonces[i].pubnonce);
+        cJSON *reply = ok ? wire_build_channel_nonces(cid, (const unsigned char (*)[66])pn, mine)
+                          : NULL;
+        free(pn);
+        ok = reply && wire_send(fd, MSG_CHANNEL_NONCES, reply);
+        cJSON_Delete(reply);
+        if (ok) channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])lsp_nonces, n);
+    }
+    free(lsp_nonces);
+    if (!ok) fprintf(stderr, "Client: nonce refresh failed\n");
     return ok;
 }
 
@@ -1045,8 +1139,26 @@ int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
     }
     int ok = client_handle_initial_commitment_signed(ch, &msg);
     cJSON_Delete(msg.json);
-    if (!ok)
+    if (!ok) {
         fprintf(stderr, "Client %u: initial commitment rejected, channel not usable\n",
+                my_index);
+        return 0;
+    }
+    /* Co-sign the LSP's commitment 0 in turn: from channel open on, the LSP
+       can close this channel by itself before the end date. */
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddNumberToObject(reply, "channel_id", 0);
+    cJSON_AddNumberToObject(reply, "commitment_number", 0);
+    /* Test hook, inert unless cheats are allowed (regtest only): send the
+       message without the co-signature. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_NO_HOST_COMMIT_SIG"))
+        ok = reply && wire_send(fd, MSG_HOST_COMMITMENT_SIG, reply);
+    else
+        ok = reply && client_add_host_commit_sig(ch, reply) &&
+             wire_send(fd, MSG_HOST_COMMITMENT_SIG, reply);
+    cJSON_Delete(reply);
+    if (!ok)
+        fprintf(stderr, "Client %u: could not send the LSP its signed commitment 0\n",
                 my_index);
     return ok;
 }
@@ -1180,6 +1292,12 @@ int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
 int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32) {
+    if (!client_host_old_commitments_revoked(ch)) {
+        fprintf(stderr, "Client: the LSP has not revoked an older commitment of its "
+                "own that this member co-signed -- not releasing the preimage of "
+                "HTLC %llu\n", (unsigned long long)htlc_id);
+        return 0;
+    }
     /* Fulfill locally */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage32))
         return 0;
@@ -2071,6 +2189,36 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
         return -1;
     }
 
+    /* End-date payouts: every payout on this member's path must carry a
+       signature valid for the payout this member built itself.  Without them
+       the member has no claim at the end date on an output that is on chain,
+       so the factory is refused. */
+    if (my_index > 0) {
+        cJSON *np_j = cJSON_GetObjectItem(json, "n_payouts");
+        size_t np = (np_j && cJSON_IsNumber(np_j)) ? (size_t)np_j->valuedouble : 0;
+        unsigned char *sigs = (np == f->n_payouts && np > 0) ? malloc(np * 64) : NULL;
+        int got = sigs && wire_json_get_hex(json, "payout_sigs", sigs, np * 64) == (int)(np * 64);
+        size_t mine = 0;
+        for (size_t pi = 0; pi < f->n_payouts; pi++) {
+            if (!factory_payout_on_path(f, pi, my_index)) continue;
+            if (!got || !factory_payout_attach_sig(f, pi, sigs + pi * 64)) {
+                fprintf(stderr, "Client: FACTORY_READY lacks a valid end-date payout for "
+                        "output %u:%u on this member's path -- REFUSING factory\n",
+                        f->payouts[pi].node_idx, f->payouts[pi].vout);
+                free(sigs);
+                return -1;
+            }
+            mine++;
+        }
+        free(sigs);
+        if (f->n_payouts > 0 && mine == 0) {
+            fprintf(stderr, "Client: no end-date payout on this member's path -- "
+                    "REFUSING factory\n");
+            return -1;
+        }
+        printf("Client: verified %zu end-date payouts on this member's path\n", mine);
+    }
+
     /* Signed distribution TX, if present.  It is the client's exit when the
        factory expires, so it is stored only after it has been checked against
        the client's own construction of that transaction; one that fails the
@@ -2183,7 +2331,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
             rot_n_level_arity > 0 ? rot_level_arities : NULL, rot_n_level_arity,
             (factory_arity_t)rot_leaf_arity, 1, n_participants - 1,
             rot_static_threshold, step_blocks, states_per_layer);
-        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+        if (!client_check_proposed_cltv(cltv_timeout, exit_blocks,
                                         cltv_err, sizeof(cltv_err))) {
             fprintf(stderr, "Client %u: REFUSING rotation: %s\n", my_index, cltv_err);
             return 0;
@@ -2863,7 +3011,30 @@ static int client_factory_creation_stateless_signing(
             my_dist_gen = 1;
         }
     }
+    /* End-date payouts: one fresh nonce per payout this member co-signs (the
+       payouts of the outputs on its path), in payout order.  The member built
+       every payout itself from its own tree, so it signs only its own bytes. */
+    size_t my_np = factory_payout_count_for_signer(factory, my_index);
+    secp256k1_musig_secnonce *my_payout_sn = calloc(my_np ? my_np : 1, sizeof(*my_payout_sn));
+    unsigned char *my_payout_pn = calloc(my_np ? my_np : 1, 66);
+    int payout_ok = my_payout_sn && my_payout_pn && factory_payout_sessions_init(factory);
+    for (size_t pi = 0, k = 0; payout_ok && pi < factory->n_payouts; pi++) {
+        int ps = factory_payout_signer_slot(factory, pi, my_index);
+        if (ps < 0) continue;
+        secp256k1_musig_pubnonce pn;
+        payout_ok = musig_generate_nonce(ctx, &my_payout_sn[k], &pn, my_seckey, &my_pubkey,
+                                         &factory->payouts[pi].keyagg.cache) &&
+                    factory_payout_session_set_nonce(factory, pi, (size_t)ps, &pn) &&
+                    musig_pubnonce_serialize(ctx, my_payout_pn + k * 66, &pn);
+        k++;
+    }
     memset(my_seckey, 0, 32);
+    if (!payout_ok) {
+        fprintf(stderr, "Client-stateless %u: end-date payout nonces failed\n", my_index);
+        free(my_payout_sn); free(my_payout_pn);
+        free(my_secnonces); free(my_slot); free(my_pn_per_node);
+        return 0;
+    }
 
     /* Send CLIENT_PUBNONCES (per-node; unsigned nodes carry zero nonce). */
     {
@@ -2871,10 +3042,14 @@ static int client_factory_creation_stateless_signing(
         free(my_pn_per_node);
         if (cpn && my_dist_gen)   /* #54 G1b: include this client's dist pubnonce */
             wire_json_add_hex(cpn, "dist_pubnonce", my_dist_pn, 66);
+        if (cpn && my_np > 0)
+            wire_json_add_hex(cpn, "payout_pubnonces", my_payout_pn, my_np * 66);
+        free(my_payout_pn);
+        my_payout_pn = NULL;
         if (!cpn || !wire_send(fd, MSG_FACTORY_CLIENT_PUBNONCES, cpn)) {
             fprintf(stderr, "Client-stateless %u: send CLIENT_PUBNONCES failed\n", my_index);
             if (cpn) cJSON_Delete(cpn);
-            free(my_secnonces); free(my_slot);
+            free(my_secnonces); free(my_slot); free(my_payout_sn);
             return 0;
         }
         cJSON_Delete(cpn);
@@ -2887,7 +3062,7 @@ static int client_factory_creation_stateless_signing(
         fprintf(stderr, "Client-stateless %u: expected LSP_RESPONSE, got 0x%02x\n",
                 my_index, lr.json ? lr.msg_type : 0);
         if (lr.json) cJSON_Delete(lr.json);
-        free(my_secnonces); free(my_slot);
+        free(my_secnonces); free(my_slot); free(my_payout_sn);
         return 0;
     }
     unsigned char *lsp_pn_per_node = calloc(nn, 66);
@@ -2898,7 +3073,7 @@ static int client_factory_creation_stateless_signing(
     if (!lsp_pn_per_node || !lsp_psig_per_node || !all_pn) {
         cJSON_Delete(lr.json);
         free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
-        free(my_secnonces); free(my_slot);
+        free(my_secnonces); free(my_slot); free(my_payout_sn);
         return 0;
     }
     if (!wire_parse_factory_lsp_response(lr.json, lsp_pn_per_node,
@@ -2908,7 +3083,7 @@ static int client_factory_creation_stateless_signing(
         fprintf(stderr, "Client-stateless %u: parse LSP_RESPONSE failed\n", my_index);
         cJSON_Delete(lr.json);
         free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
-        free(my_secnonces); free(my_slot);
+        free(my_secnonces); free(my_slot); free(my_payout_sn);
         return 0;
     }
     /* #54 G1b: distribution-TX dist co-signing (self-contained; runs only if the
@@ -3003,6 +3178,47 @@ static int client_factory_creation_stateless_signing(
         }
     }
 
+    /* End-date payouts: every co-signer's nonce from the LSP's matrix, then
+       this member's partial signature over the payout it built itself. */
+    unsigned char *my_payout_ps = calloc(my_np ? my_np : 1, 32);
+    {
+        size_t mlen = factory_payout_nonce_offset(factory, factory->n_payouts);
+        unsigned char *mtx = calloc(mlen ? mlen : 1, 1);
+        int ok = my_payout_ps && mtx &&
+                 (mlen == 0 || wire_json_get_hex(lr.json, "payout_pubnonces_all", mtx, mlen) ==
+                               (int)mlen);
+        for (size_t pi = 0, k = 0; ok && pi < factory->n_payouts; pi++) {
+            int ps = factory_payout_signer_slot(factory, pi, my_index);
+            if (ps < 0) continue;
+            const unsigned char *row = mtx + factory_payout_nonce_offset(factory, pi);
+            for (uint32_t sl = 0; ok && sl < factory->payouts[pi].n_signers; sl++) {
+                if ((int)sl == ps) continue;
+                secp256k1_musig_pubnonce pn;
+                ok = musig_pubnonce_parse(ctx, &pn, row + (size_t)sl * 66) &&
+                     factory_payout_session_set_nonce(factory, pi, sl, &pn);
+            }
+            secp256k1_musig_partial_sig psig;
+            ok = ok && factory_payout_session_finalize(factory, pi) &&
+                 musig_create_partial_sig(ctx, &psig, &my_payout_sn[k], keypair,
+                                          &factory->payouts[pi].session) &&
+                 musig_partial_sig_serialize(ctx, my_payout_ps + k * 32, &psig);
+            k++;
+        }
+        free(mtx);
+        if (!ok) {
+            fprintf(stderr, "Client-stateless %u: end-date payout signing failed -- "
+                    "refusing the factory\n", my_index);
+            cJSON_Delete(lr.json);
+            free(my_payout_ps); free(my_payout_sn);
+            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+            free(my_secnonces); free(my_slot);
+            return 0;
+        }
+    }
+    if (my_payout_sn) memset(my_payout_sn, 0, (my_np ? my_np : 1) * sizeof(*my_payout_sn));
+    free(my_payout_sn);
+    my_payout_sn = NULL;
+
     cJSON_Delete(lr.json);
     (void)lsp_psig_per_node;  /* LSP psigs are aggregated LSP-side, not by client. */
 
@@ -3017,6 +3233,7 @@ static int client_factory_creation_stateless_signing(
             fprintf(stderr, "Client-stateless %u: no LSP slot node %zu\n", my_index, nidx);
             free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
             free(my_secnonces); free(my_slot);
+            free(my_payout_ps);
             return 0;
         }
         secp256k1_musig_pubnonce lsp_pn;
@@ -3025,6 +3242,7 @@ static int client_factory_creation_stateless_signing(
             fprintf(stderr, "Client-stateless %u: set LSP nonce node %zu failed\n", my_index, nidx);
             free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
             free(my_secnonces); free(my_slot);
+            free(my_payout_ps);
             return 0;
         }
         if (have_matrix) {
@@ -3040,7 +3258,8 @@ static int client_factory_creation_stateless_signing(
                             my_index, nidx, snum);
                     free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
                     free(my_secnonces); free(my_slot);
-                    return 0;
+                    free(my_payout_ps);
+            return 0;
                 }
             }
         }
@@ -3048,6 +3267,7 @@ static int client_factory_creation_stateless_signing(
             fprintf(stderr, "Client-stateless %u: finalize_node %zu failed\n", my_index, nidx);
             free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
             free(my_secnonces); free(my_slot);
+            free(my_payout_ps);
             return 0;
         }
     }
@@ -3055,7 +3275,7 @@ static int client_factory_creation_stateless_signing(
 
     /* Create own per-node psigs (zeroes each consumed secnonce). */
     unsigned char *my_psig_per_node = calloc(nn, 32);
-    if (!my_psig_per_node) { free(my_secnonces); free(my_slot); return 0; }
+    if (!my_psig_per_node) { free(my_secnonces); free(my_slot); free(my_payout_ps); return 0; }
     for (size_t nidx = 0; nidx < nn; nidx++) {
         if (my_slot[nidx] < 0) continue;
         secp256k1_musig_partial_sig my_psig;
@@ -3064,6 +3284,7 @@ static int client_factory_creation_stateless_signing(
                                        &factory->nodes[nidx].signing_session)) {
             fprintf(stderr, "Client-stateless %u: create_partial_sig node %zu failed\n", my_index, nidx);
             free(my_psig_per_node); free(my_secnonces); free(my_slot);
+            free(my_payout_ps);
             return 0;
         }
         /* my_secnonces[nidx] zeroed by musig_create_partial_sig. */
@@ -3110,6 +3331,10 @@ static int client_factory_creation_stateless_signing(
         free(my_psig_per_node);
         if (fp && my_dist_done)   /* #54 G1b: include this client's dist partial sig */
             wire_json_add_hex(fp, "dist_psig", my_dist_psig, 32);
+        if (fp && my_np > 0)
+            wire_json_add_hex(fp, "payout_psigs", my_payout_ps, my_np * 32);
+        free(my_payout_ps);
+        my_payout_ps = NULL;
         if (!fp || !wire_send(fd, MSG_FACTORY_CLIENT_FINAL_PSIGS, fp)) {
             fprintf(stderr, "Client-stateless %u: send CLIENT_FINAL_PSIGS failed\n", my_index);
             if (fp) cJSON_Delete(fp);
@@ -3330,7 +3555,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             (factory_arity_t)leaf_arity,
             ps_subfactory_arity_in > 1 ? ps_subfactory_arity_in : 1, n_participants - 1,
             static_threshold_depth, step_blocks, states_per_layer);
-        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+        if (!client_check_proposed_cltv(cltv_timeout, exit_blocks,
                                         cltv_err, sizeof(cltv_err))) {
             fprintf(stderr, "Client: REFUSING factory: %s\n", cltv_err);
             client_send_error(fd, "factory CLTV timeout is not safely in the future");

@@ -141,8 +141,6 @@ static int setup_mirror_channel(secp256k1_context *ctx, channel_t *L, channel_t 
     C->use_cpfp_anchor = L->use_cpfp_anchor;  /* MUST match or the sighash diverges */
     C->funding_keyagg = L->funding_keyagg;    /* same aggregate, opposite seat */
     C->local_funding_signer_idx = 1 - L->local_funding_signer_idx;
-    C->has_chan_merkle_root = L->has_chan_merkle_root;
-    memcpy(C->chan_merkle_root, L->chan_merkle_root, 32);
 
     if (!channel_generate_random_basepoints(C)) return 0;
     /* basepoint exchange, both directions */

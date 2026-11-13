@@ -128,8 +128,7 @@ void client_dist_watch_free(client_dist_watch_t *w);
 /* Unilateral exit: before the factory tree is published, decide whether
    the distribution TX settles the factory instead.  Publishing the tree
    spends the funding output, after which the distribution TX can never
-   confirm; once the TX is due it is the exit (after its nLockTime the
-   tree's timeout paths are open as well).  Returns 1 when the
+   confirm; once the TX is due it is the exit.  Returns 1 when the
    distribution TX settles the factory (client_dist_settles): the caller
    must then publish nothing of the tree.  Returns 0 when the tree is the
    exit: TX not yet due, funding output spent or its state unknown, or no
@@ -137,5 +136,21 @@ void client_dist_watch_free(client_dist_watch_t *w);
 int client_dist_force_close(persist_t *db, chain_backend_t *chain,
                             client_dist_send_fn send, FILE *out,
                             client_dist_status_t *status_out);
+
+/* End-date payouts stored for factory_id: once the tip has reached their
+   nLockTime, send each one whose shared output is on chain and unspent.
+   Returns the number sent. */
+int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
+                         client_dist_send_fn send, FILE *out);
+
+/* From the end date on, once the funding output is spent (the distribution
+   TX can no longer confirm): publish the next pre-signed node of this
+   member's path (participant >= 1), down to the first output on the path
+   that has an end-date payout.  Called with client_payouts_claim, it takes
+   the member to its share with no message from the LSP.  Returns 1 if a node
+   was sent or is in the mempool, 0 if there is nothing to push now, -1 on
+   error. */
+int client_path_push(const factory_t *f, uint32_t participant, chain_backend_t *chain,
+                     client_dist_send_fn send, FILE *out);
 
 #endif /* SUPERSCALAR_CLIENT_DIST_H */

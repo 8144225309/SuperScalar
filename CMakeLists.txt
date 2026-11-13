@@ -132,6 +132,7 @@ add_library(superscalar
     src/p2p_bitcoin.c
     src/util.c
     src/factory.c
+    src/factory_payout.c
     src/tapscript.c
     src/shachain.c
     src/channel.c
@@ -290,6 +291,7 @@ add_executable(test_superscalar
     tests/test_factory.c
     tests/test_factory_multi_input_keyagg.c
     tests/test_tapscript.c
+    tests/test_end_date_payout.c
     tests/test_shachain.c
     tests/test_channel.c
     tests/test_adaptor.c

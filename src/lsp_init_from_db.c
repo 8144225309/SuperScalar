@@ -161,28 +161,19 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         {
             musig_keyagg_t ka;
             uint32_t signer_idx;
-            unsigned char merkle[32];
-            int has_merkle = 0;
             if (!channel_discover_funding_keyagg(
-                    ctx, &lsp_pubkey, client_pubkey, &lsp_pubkey,
-                    factory->cltv_timeout, state_node->cltv_timeout,
+                    ctx, &lsp_pubkey, client_pubkey,
                     funding_spk, funding_spk_len,
-                    &ka, &signer_idx, merkle, &has_merkle)) {
+                    &ka, &signer_idx)) {
                 fprintf(stderr,
                         "LSP recovery: channel %zu funding_keyagg discovery "
-                        "failed (factory_cltv=%u, node_cltv=%u). Refusing "
-                        "to load — on-chain spends would fail Schnorr verify.\n",
-                        c, factory->cltv_timeout, state_node->cltv_timeout);
+                        "failed: neither key order gives the channel output. "
+                        "Refusing to load: on-chain spends would fail Schnorr verify.\n",
+                        c);
                 return 0;
             }
             entry->channel.funding_keyagg = ka;
             entry->channel.local_funding_signer_idx = signer_idx;
-            if (has_merkle) {
-                memcpy(entry->channel.chan_merkle_root, merkle, 32);
-                entry->channel.has_chan_merkle_root = 1;
-            } else {
-                entry->channel.has_chan_merkle_root = 0;
-            }
         }
 
         /* Load basepoints from DB instead of generating random ones */
@@ -223,6 +214,22 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.local_amount = loaded_local;
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
+
+        /* The LSP's own latest commitment the member co-signed, fully
+           signed: the LSP revokes an older one only after it holds the newer
+           one, so the stored one is never revoked. */
+        {
+            uint64_t hcn = 0;
+            unsigned char hsig[64];
+            channel_t *hc = &entry->channel;
+            if (persist_load_host_commitment(pdb, (uint32_t)c, &hcn, hsig, hc->host_commit_txid,
+                                             hc->host_commit_tx, CHANNEL_HOST_COMMIT_TX_MAX,
+                                             &hc->host_commit_tx_len)) {
+                memcpy(hc->latest_commitment_sig, hsig, 64);
+                hc->has_latest_commitment_sig = 1;
+                hc->latest_commitment_sig_cn = hcn;
+            }
+        }
 
         /* v31: a funding freeze persisted before the restart stays in force
            until lsp_channels_revalidate_funding() re-checks it; the daemon

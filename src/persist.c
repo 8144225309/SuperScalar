@@ -1512,6 +1512,39 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v48: the LSP's own latest commitment signature per channel, co-signed
+       by the member (what the LSP's forced exit publishes), and the
+       end-date payouts a member holds (below).  CREATE TABLE IF NOT EXISTS
+       is idempotent, so no version gate. */
+    sqlite3_exec(p->db,
+        "CREATE TABLE IF NOT EXISTS host_commitments ("
+        "  channel_id INTEGER PRIMARY KEY,"
+        "  commitment_number INTEGER NOT NULL,"
+        "  sig64_hex TEXT NOT NULL,"
+        "  txid TEXT NOT NULL,"            /* internal order */
+        "  signed_tx_hex TEXT NOT NULL"
+        ");", NULL, NULL, NULL);
+
+    /* v48: end-date payouts a member holds: the signed payout of every
+       shared output on its path, keyed by the output it spends. */
+    {
+        char *po_err = NULL;
+        if (sqlite3_exec(p->db,
+                "CREATE TABLE IF NOT EXISTS factory_payouts ("
+                "  factory_id INTEGER NOT NULL,"
+                "  prev_txid TEXT NOT NULL,"       /* display hex */
+                "  prev_vout INTEGER NOT NULL,"
+                "  locktime INTEGER NOT NULL,"
+                "  signed_tx_hex TEXT NOT NULL,"
+                "  PRIMARY KEY (factory_id, prev_txid, prev_vout)"
+                ");",
+                NULL, NULL, &po_err) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: factory_payouts table error: %s\n",
+                    po_err ? po_err : "unknown");
+            sqlite3_free(po_err);
+        }
+    }
+
     /* Client record of a cooperative close it has co-signed: one row per
        factory, keyed by the factory's funding outpoint.  Written before the
        client releases its partial signature, so a client that restarts
@@ -5005,6 +5038,34 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 }
 
 /* --- Factory tree nodes (Phase 22) --- */
+
+int persist_load_tree_node_signed_tx(persist_t *p, uint32_t factory_id,
+                                     uint32_t node_index, tx_buf_t *out) {
+    if (!p || !p->db || !out) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT signed_tx_hex FROM tree_nodes WHERE factory_id = ? AND node_index = ?;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, (int)node_index);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *h = (const char *)sqlite3_column_text(st, 0);
+        size_t hl = h ? strlen(h) : 0;
+        if (hl >= 2 && hl % 2 == 0 && hl / 2 <= 400000) {
+            tx_buf_init(out, hl / 2);
+            if (out->data && hex_decode(h, out->data, hl / 2) == (int)(hl / 2)) {
+                out->len = hl / 2;
+                ok = 1;
+            } else {
+                tx_buf_free(out);
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
 
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id) {
     if (!p || !p->db || !f) return 0;
@@ -8592,3 +8653,147 @@ int persist_scan_ceremonies_by_factory(persist_t *p,
 }
 
 /* === End SF-CEREMONY-HELPERS ============================================== */
+
+/* --- End-date payouts --- */
+
+int persist_save_payouts(persist_t *p, uint32_t factory_id, const factory_t *f,
+                         uint32_t participant) {
+    if (!p || !p->db || !f) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO factory_payouts "
+        "(factory_id, prev_txid, prev_vout, locktime, signed_tx_hex) VALUES (?,?,?,?,?);";
+    /* The factory's payouts replace whatever this id held before. */
+    {
+        sqlite3_stmt *del;
+        if (sqlite3_prepare_v2(p->db, "DELETE FROM factory_payouts WHERE factory_id = ?;",
+                               -1, &del, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int(del, 1, (int)factory_id);
+        int dok = sqlite3_step(del) == SQLITE_DONE;
+        sqlite3_finalize(del);
+        if (!dok) return 0;
+    }
+    for (size_t pi = 0; pi < f->n_payouts; pi++) {
+        const factory_payout_t *po = &f->payouts[pi];
+        if (participant != 0 && !factory_payout_on_path(f, pi, participant)) continue;
+        if (!po->is_signed || po->signed_tx.len == 0) return 0;
+        unsigned char txid[32];
+        memcpy(txid, f->nodes[po->node_idx].txid, 32);
+        reverse_bytes(txid, 32);
+        char txid_hex[65];
+        hex_encode(txid, 32, txid_hex);
+        char *hex = malloc(po->signed_tx.len * 2 + 1);
+        if (!hex) return 0;
+        hex_encode(po->signed_tx.data, po->signed_tx.len, hex);
+        sqlite3_stmt *st;
+        int ok = sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_int(st, 1, (int)factory_id);
+            sqlite3_bind_text(st, 2, txid_hex, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 3, (int)po->vout);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)f->cltv_timeout);
+            sqlite3_bind_text(st, 5, hex, -1, SQLITE_TRANSIENT);
+            ok = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+        free(hex);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+size_t persist_load_payouts(persist_t *p, uint32_t factory_id,
+                            persist_payout_row_t *rows, size_t max_rows) {
+    if (!p || !p->db || !rows) return 0;
+    const char *sql = "SELECT prev_txid, prev_vout, locktime, signed_tx_hex "
+                      "FROM factory_payouts WHERE factory_id = ? "
+                      "ORDER BY prev_txid, prev_vout;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    size_t n = 0;
+    while (n < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        const char *h = (const char *)sqlite3_column_text(st, 3);
+        if (!t || !h || strlen(t) != 64) continue;
+        size_t len = strlen(h) / 2;
+        unsigned char *tx = malloc(len ? len : 1);
+        if (!tx) break;
+        if (hex_decode(h, tx, len) != (int)len) { free(tx); continue; }
+        persist_payout_row_t *r = &rows[n++];
+        snprintf(r->prev_txid_hex, sizeof(r->prev_txid_hex), "%s", t);
+        r->prev_vout = (uint32_t)sqlite3_column_int(st, 1);
+        r->locktime = (uint32_t)sqlite3_column_int64(st, 2);
+        r->tx = tx;
+        r->tx_len = len;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+void persist_free_payout_rows(persist_payout_row_t *rows, size_t n) {
+    for (size_t i = 0; rows && i < n; i++) {
+        free(rows[i].tx);
+        rows[i].tx = NULL;
+    }
+}
+
+/* --- The LSP's own commitment signature --- */
+
+int persist_save_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t commitment_number, const unsigned char sig64[64],
+                                 const unsigned char txid32[32],
+                                 const unsigned char *tx, size_t tx_len) {
+    if (!p || !p->db || !sig64 || !txid32 || !tx || tx_len == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO host_commitments "
+            "(channel_id, commitment_number, sig64_hex, txid, signed_tx_hex) "
+            "VALUES (?,?,?,?,?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    char sh[129], th[65];
+    char *txh = malloc(tx_len * 2 + 1);
+    if (!txh) { sqlite3_finalize(st); return 0; }
+    hex_encode(sig64, 64, sh);
+    hex_encode(txid32, 32, th);
+    hex_encode(tx, tx_len, txh);
+    sqlite3_bind_int(st, 1, (int)channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)commitment_number);
+    sqlite3_bind_text(st, 3, sh, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, th, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, txh, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    free(txh);
+    return ok;
+}
+
+int persist_load_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t *commitment_number_out, unsigned char sig64_out[64],
+                                 unsigned char txid_out32[32],
+                                 unsigned char *tx_out, size_t tx_max, size_t *tx_len_out) {
+    if (!p || !p->db || !sig64_out || !txid_out32 || !tx_out || !tx_len_out) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT commitment_number, sig64_hex, txid, signed_tx_hex FROM host_commitments "
+            "WHERE channel_id = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)channel_id);
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *sh = (const char *)sqlite3_column_text(st, 1);
+        const char *th = (const char *)sqlite3_column_text(st, 2);
+        const char *xh = (const char *)sqlite3_column_text(st, 3);
+        size_t xl = xh ? strlen(xh) / 2 : 0;
+        if (sh && th && xh && strlen(sh) == 128 && strlen(th) == 64 && xl > 0 && xl <= tx_max &&
+            hex_decode(sh, sig64_out, 64) == 64 && hex_decode(th, txid_out32, 32) == 32 &&
+            hex_decode(xh, tx_out, xl) == (int)xl) {
+            if (commitment_number_out)
+                *commitment_number_out = (uint64_t)sqlite3_column_int64(st, 0);
+            *tx_len_out = xl;
+            found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}

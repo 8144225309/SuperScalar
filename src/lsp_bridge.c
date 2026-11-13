@@ -784,7 +784,7 @@ int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (sent &&
             lsp_channels_recv_client_reply(fd, &ack_msg, MSG_REVOKE_AND_ACK, 30) &&
-            wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+            lsp_parse_member_revoke(ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
             uint64_t old_cn = ch->commitment_number - 1;
@@ -1230,7 +1230,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             uint32_t ack_chan_id;
             unsigned char rev_secret[32], next_point[33];
-            if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+            if (lsp_parse_member_revoke(dest_ch, ack_msg.json, &ack_chan_id,
                                             rev_secret, next_point) &&
                 lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                 uint64_t old_cn = dest_ch->commitment_number - 1;

@@ -75,6 +75,11 @@
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
 #define MSG_JIT_REJECT          0x90  /* Client -> LSP: decline a JIT channel offer */
+/* Client -> LSP, at channel open, after the LSP's initial COMMITMENT_SIGNED:
+   the member's partial signature over the LSP's own commitment 0
+   (host_commit_psig, host_commit_nonce_index).  Later commitments carry the
+   same two fields in REVOKE_AND_ACK. */
+#define MSG_HOST_COMMITMENT_SIG 0x9B
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */

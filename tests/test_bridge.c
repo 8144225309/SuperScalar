@@ -1033,7 +1033,38 @@ typedef struct {
     uint32_t payee_my_index;
 } bridge_payee_data_t;
 
+
+/* The member's side of an update, as the daemon runs it: answer the LSP's
+   COMMITMENT_SIGNED, then take the LSP's revocation of its previous
+   commitment, which the LSP sends right after the member's REVOKE_AND_ACK
+   (client_recv_lsp_revocation in the daemon).  A member releases no
+   preimage before it.  Anything else that arrives first is kept for the
+   next receive. */
+static wire_msg_t g_bridge_pushback;
+static int g_bridge_has_pushback;
+
+static int bridge_member_update(int fd, channel_t *ch, secp256k1_context *ctx,
+                               const wire_msg_t *cs) {
+    if (!client_handle_commitment_signed(fd, ch, ctx, cs)) return 0;
+    if (ch->commitment_number == 0) return 1;
+    wire_msg_t rv;
+    memset(&rv, 0, sizeof(rv));
+    if (!wire_recv_timeout(fd, &rv, 10)) return 0;
+    if (rv.msg_type == MSG_LSP_REVOKE_AND_ACK) {
+        int ok = client_handle_lsp_revoke_and_ack(ch, ctx, &rv);
+        if (rv.json) cJSON_Delete(rv.json);
+        return ok;
+    }
+    g_bridge_pushback = rv;
+    g_bridge_has_pushback = 1;
+    return 1;
+}
 static int recv_skip_revocations_bridge(int fd, wire_msg_t *out) {
+    if (g_bridge_has_pushback) {
+        *out = g_bridge_pushback;
+        g_bridge_has_pushback = 0;
+        return 1;
+    }
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
         if (out->msg_type != 0x50) return 1;  /* MSG_LSP_REVOKE_AND_ACK */
@@ -1088,7 +1119,7 @@ static int bridge_payee_cb(int fd, channel_t *ch, uint32_t my_index,
         return 0;
     }
     if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        bridge_member_update(fd, ch, ctx, &msg);
         cJSON_Delete(msg.json);
     } else {
         cJSON_Delete(msg.json);
@@ -1112,7 +1143,7 @@ static int bridge_payee_cb(int fd, channel_t *ch, uint32_t my_index,
         return 0;
     }
     if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        bridge_member_update(fd, ch, ctx, &msg);
         cJSON_Delete(msg.json);
     } else {
         cJSON_Delete(msg.json);
@@ -1526,7 +1557,7 @@ static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
         return 0;
     }
     if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        bridge_member_update(fd, ch, ctx, &msg);
         cJSON_Delete(msg.json);
     } else {
         cJSON_Delete(msg.json);
@@ -1550,7 +1581,7 @@ static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
         return 0;
     }
     if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
+        bridge_member_update(fd, ch, ctx, &msg);
         cJSON_Delete(msg.json);
     } else {
         cJSON_Delete(msg.json);
@@ -1611,7 +1642,7 @@ static int bridge_out_sender_cb(int fd, channel_t *ch, uint32_t my_index,
         fprintf(stderr, "OUT sender %u: recv commit failed\n", my_index); return 0;
     }
     if (m.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &m);
+        bridge_member_update(fd, ch, ctx, &m);
         cJSON_Delete(m.json);
     } else {
         fprintf(stderr, "OUT sender %u: expected COMMIT_SIGNED, got 0x%02x\n",
@@ -1638,7 +1669,7 @@ static int bridge_out_sender_cb(int fd, channel_t *ch, uint32_t my_index,
     /* COMMITMENT_SIGNED for the fulfill. */
     if (recv_skip_revocations_bridge(fd, &m)) {
         if (m.msg_type == MSG_COMMITMENT_SIGNED)
-            client_handle_commitment_signed(fd, ch, ctx, &m);
+            bridge_member_update(fd, ch, ctx, &m);
         cJSON_Delete(m.json);
     }
     return 1;

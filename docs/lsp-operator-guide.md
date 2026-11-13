@@ -282,7 +282,6 @@ These flags run after the `--demo` payment sequence to test specific protocol fe
 |------|---------|-------------|
 | `--breach-test` | off | Broadcast revoked commitment, trigger watchtower penalty |
 | `--cheat-daemon` | off | Broadcast revoked commitment and sleep (clients detect) |
-| `--test-expiry` | off | Mine past CLTV, recover via timeout script path |
 | `--test-distrib` | off | Broadcast pre-signed distribution TX (nLockTime fallback) |
 | `--test-turnover` | off | PTLC key turnover, close with extracted keys |
 | `--test-rotation` | off | Full factory rotation lifecycle (implies `--enable-rotation-experimental`) |

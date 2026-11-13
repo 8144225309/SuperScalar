@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 43
+#define PERSIST_SCHEMA_VERSION 48
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -756,6 +756,12 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 
 /* Save all tree nodes for a factory (includes signed_tx_hex if available). */
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id);
+/* The signed transaction stored for one tree node (tx_buf_init'ed into out).
+   persist_load_factory checks every stored row against the rebuilt tree and
+   its signature, but keeps the rebuilt (unsigned) bytes where they match;
+   this fetches the signed ones.  Returns 1 if found. */
+int persist_load_tree_node_signed_tx(persist_t *p, uint32_t factory_id,
+                                     uint32_t node_index, tx_buf_t *out);
 
 /* --- Broadcast audit log --- */
 
@@ -1424,6 +1430,34 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
                                   unsigned char *signed_tx_out,
                                   size_t *signed_tx_len_out,
                                   size_t max_len);
+
+/* --- The LSP's own commitment signature (co-signed by the member) --- */
+int persist_save_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t commitment_number, const unsigned char sig64[64],
+                                 const unsigned char txid32[32],
+                                 const unsigned char *tx, size_t tx_len);
+int persist_load_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t *commitment_number_out, unsigned char sig64_out[64],
+                                 unsigned char txid_out32[32],
+                                 unsigned char *tx_out, size_t tx_max, size_t *tx_len_out);
+
+/* --- End-date payouts --- */
+typedef struct {
+    char prev_txid_hex[65];   /* the shared output it spends, display order */
+    uint32_t prev_vout;
+    uint32_t locktime;        /* the factory's end date */
+    unsigned char *tx;        /* signed payout (heap) */
+    size_t tx_len;
+} persist_payout_row_t;
+
+/* Store every signed payout on participant's path (0 = every payout); 0 if
+   one of them is not signed. */
+int persist_save_payouts(persist_t *p, uint32_t factory_id, const factory_t *f,
+                         uint32_t participant);
+/* Load up to max_rows payouts of factory_id; free with persist_free_payout_rows. */
+size_t persist_load_payouts(persist_t *p, uint32_t factory_id,
+                            persist_payout_row_t *rows, size_t max_rows);
+void persist_free_payout_rows(persist_payout_row_t *rows, size_t n);
 
 /* --- Pending sweeps (schema v12) --- */
 /* persist_save_sweep / persist_load_sweeps / persist_delete_sweep

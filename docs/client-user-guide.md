@@ -53,7 +53,7 @@ echo "Save this: $MY_KEY"
 ./superscalar_client --keyfile my.key --passphrase "my passphrase" ...
 ```
 
-With BIP39, you can recover your key from the 24 words at any time. Without it, if you lose your key, you lose access to your channel balance. The LSP cannot recover it for you — though your funds will eventually be recoverable via the CLTV timeout path.
+With BIP39, you can recover your key from the 24 words at any time. Without it, if you lose your key, you lose access to your channel balance. The LSP cannot recover it for you: the end-date payouts and your commitment pay to your key.
 
 **How the keyfile is handled**
 

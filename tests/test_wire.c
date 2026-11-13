@@ -2418,5 +2418,12 @@ int test_wire_msg_ids_unique(void) {
     TEST_ASSERT(seen[MSG_JIT_REJECT] && seen[MSG_BRIDGE_PAY_RESULT_ACK] &&
                 MSG_JIT_REJECT != MSG_BRIDGE_PAY_RESULT_ACK,
                 "JIT_REJECT and BRIDGE_PAY_RESULT_ACK have their own ids");
+    /* HOST_COMMITMENT_SIG keeps clear of 0x91-0x9A, reserved by the
+       channel-update engine and the open PRs before it. */
+    TEST_ASSERT(MSG_HOST_COMMITMENT_SIG == 0x9B && seen[0x9B] == 1,
+                "HOST_COMMITMENT_SIG is 0x9B");
+    TEST_ASSERT(strcmp(wire_msg_type_name(MSG_HOST_COMMITMENT_SIG), "HOST_COMMITMENT_SIG") == 0,
+                "HOST_COMMITMENT_SIG has its name");
     return 1;
 }
+

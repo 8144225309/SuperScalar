@@ -2511,15 +2511,7 @@
                 for (int i = 0; i < 32; i++)
                     sprintf(agg_xonly_hex + i * 2, "%02x", agg_xonly_ser[i]);
                 agg_xonly_hex[64] = 0;
-                char chan_merkle_hex[65];
-                if (ch0->has_chan_merkle_root) {
-                    for (int i = 0; i < 32; i++)
-                        sprintf(chan_merkle_hex + i * 2,
-                                "%02x", ch0->chan_merkle_root[i]);
-                } else {
-                    strcpy(chan_merkle_hex, "none");
-                }
-                chan_merkle_hex[64] = 0;
+                char chan_merkle_hex[65] = "none";   /* key path only */
                 /* LSP funding pubkey (compressed 33 bytes) */
                 secp256k1_pubkey lsp_pub_dbg;
                 unsigned char lsp_pub_ser[33];
@@ -2552,14 +2544,7 @@
                 {
                     unsigned char twk[32];
                     extern void sha256_tagged(const char *tag, const unsigned char *data, size_t len, unsigned char *out);
-                    if (ch0->has_chan_merkle_root) {
-                        unsigned char buf[64];
-                        memcpy(buf, agg_xonly_ser, 32);
-                        memcpy(buf + 32, ch0->chan_merkle_root, 32);
-                        sha256_tagged("TapTweak", buf, 64, twk);
-                    } else {
-                        sha256_tagged("TapTweak", agg_xonly_ser, 32, twk);
-                    }
+                    sha256_tagged("TapTweak", agg_xonly_ser, 32, twk);
                     secp256k1_pubkey tweaked_full;
                     if (secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full,
                                                           &ch0->funding_keyagg.agg_pubkey,

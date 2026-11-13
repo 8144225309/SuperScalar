@@ -828,6 +828,14 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         uint32_t cltv_timeout) {
     if (!lsp) return -1;
     factory_t *f = &lsp->factory;
+    /* The end date T0 orders every exit: payouts and the distribution TX are
+       valid from it, the LSP's forced exit ends before it.  No factory is
+       proposed without one. */
+    if (cltv_timeout == 0) {
+        fprintf(stderr, "LSP: refusing to create a factory without a CLTV timeout "
+                "(end date)\n");
+        return 0;
+    }
 
     /* SF-CEREMONY-HELPERS #199 / wallet-team v34 API: journal this
        stateless factory creation in the ceremonies table.  Mirrors the
@@ -965,7 +973,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             fprintf(stderr, "LSP-stateless: factory creation retry %d/%d "
                     "(re-running with fresh nonces)\n",
                     fc_attempt + 1, SS_NONCE_RETRY_MAX + 1);
-        if (!factory_sessions_init(f)) {
+        if (!factory_sessions_init(f) || !factory_payout_sessions_init(f)) {
             fprintf(stderr, "LSP-stateless: factory_sessions_init failed\n");
             goto fail_pre;
         }
@@ -1001,6 +1009,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        never blocking factory creation. */
     unsigned char *all_pn = calloc(f->n_nodes + 1, mtx_stride);
     if (!all_pn) goto fail_pre;
+    /* End-date payouts ride the same two rounds: every payout's signer
+       nonces, slot order (factory_payout_nonce_offset).  Unlike the
+       distribution TX they are mandatory: a factory whose payouts are not all
+       co-signed is not created. */
+    size_t payout_mtx_len = factory_payout_nonce_offset(f, f->n_payouts);
+    unsigned char *payout_pn = calloc(payout_mtx_len ? payout_mtx_len : 1, 1);
+    if (!payout_pn) { free(all_pn); goto fail_pre; }
     size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
     dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
                    factory_session_init_dist(f));
@@ -1021,15 +1036,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 fprintf(stderr, "LSP-stateless: expected CLIENT_PUBNONCES from client %zu, got 0x%02x\n",
                         c, nmsg.msg_type);
             if (nmsg.json) cJSON_Delete(nmsg.json);
-            free(all_pn);
+            free(all_pn); free(payout_pn);
             goto fail_pre;
         }
         unsigned char *client_pn = calloc(f->n_nodes, 66);
-        if (!client_pn) { cJSON_Delete(nmsg.json); free(all_pn); goto fail_pre; }
+        if (!client_pn) { cJSON_Delete(nmsg.json); free(all_pn); free(payout_pn); goto fail_pre; }
         if (!wire_parse_factory_client_pubnonces(nmsg.json, client_pn,
                                                   (uint32_t)f->n_nodes)) {
             cJSON_Delete(nmsg.json);
-            free(client_pn); free(all_pn);
+            free(client_pn); free(all_pn); free(payout_pn);
             fprintf(stderr, "LSP-stateless: parse CLIENT_PUBNONCES (client %zu) failed\n", c);
             goto fail_pre;
         }
@@ -1046,6 +1061,30 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 dist_active = 0;  /* missing/bad dist nonce -> degrade gracefully */
             }
         }
+        {
+            size_t np = factory_payout_count_for_signer(f, my_part);
+            unsigned char *ppn = np ? malloc(np * 66) : NULL;
+            int ok = np == 0 || (ppn && wire_json_get_hex(nmsg.json, "payout_pubnonces",
+                                                          ppn, np * 66) == (int)(np * 66));
+            for (size_t pi = 0, k = 0; ok && pi < f->n_payouts; pi++) {
+                int ps = factory_payout_signer_slot(f, pi, my_part);
+                if (ps < 0) continue;
+                secp256k1_musig_pubnonce pn;
+                ok = musig_pubnonce_parse(lsp->ctx, &pn, ppn + k * 66) &&
+                     factory_payout_session_set_nonce(f, pi, (size_t)ps, &pn);
+                if (ok) memcpy(payout_pn + factory_payout_nonce_offset(f, pi) + (size_t)ps * 66,
+                               ppn + k * 66, 66);
+                k++;
+            }
+            free(ppn);
+            if (!ok) {
+                fprintf(stderr, "LSP-stateless: client %zu sent no valid end-date payout "
+                        "nonces\n", c);
+                cJSON_Delete(nmsg.json);
+                free(client_pn); free(all_pn); free(payout_pn);
+                goto fail_pre;
+            }
+        }
         cJSON_Delete(nmsg.json);
         for (size_t nidx = 0; nidx < f->n_nodes; nidx++) {
             int slot = factory_find_signer_slot(f, nidx, my_part);
@@ -1053,12 +1092,12 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             secp256k1_musig_pubnonce pn;
             if (!musig_pubnonce_parse(lsp->ctx, &pn, client_pn + nidx * 66)) {
                 fprintf(stderr, "LSP-stateless: bad client pubnonce (client %zu node %zu)\n", c, nidx);
-                free(client_pn); free(all_pn);
+                free(client_pn); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             if (!factory_session_set_nonce(f, nidx, (size_t)slot, &pn)) {
                 fprintf(stderr, "LSP-stateless: set client nonce node %zu slot %d failed\n", nidx, slot);
-                free(client_pn); free(all_pn);
+                free(client_pn); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             memcpy(all_pn + (nidx * (size_t)f->n_participants + (size_t)slot) * 66,
@@ -1077,12 +1116,12 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        musig_create_partial_sig before Step E's recv. */
     {
         unsigned char lsp_seckey[32];
-        if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) { free(all_pn); goto fail_pre; }
+        if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) { free(all_pn); free(payout_pn); goto fail_pre; }
         unsigned char *lsp_pn_per_node = calloc(f->n_nodes, 66);
         unsigned char *lsp_psig_per_node = calloc(f->n_nodes, 32);
         if (!lsp_pn_per_node || !lsp_psig_per_node) {
             memset(lsp_seckey, 0, 32);
-            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+            free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
             goto fail_pre;
         }
         /* #54 G1b: LSP's fresh distribution-TX dist nonce (independent of the
@@ -1112,7 +1151,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                                        &f->nodes[nidx].keyagg.cache)) {
                 fprintf(stderr, "LSP-stateless: nonce gen node %zu failed\n", nidx);
                 memset(lsp_seckey, 0, 32);
-                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             musig_pubnonce_serialize(lsp->ctx, lsp_pn_per_node + nidx * 66, &lsp_pubnonce);
@@ -1121,13 +1160,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             if (!factory_session_set_nonce(f, nidx, (size_t)slot, &lsp_pubnonce)) {
                 fprintf(stderr, "LSP-stateless: set LSP nonce node %zu failed\n", nidx);
                 memset(lsp_seckey, 0, 32);
-                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             if (!factory_session_finalize_node(f, nidx)) {
                 fprintf(stderr, "LSP-stateless: finalize_node %zu failed\n", nidx);
                 memset(lsp_seckey, 0, 32);
-                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             secp256k1_musig_partial_sig lsp_psig;
@@ -1136,14 +1175,14 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                                            &f->nodes[nidx].signing_session)) {
                 fprintf(stderr, "LSP-stateless: create_partial_sig node %zu failed\n", nidx);
                 memset(lsp_seckey, 0, 32);
-                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             /* lsp_secnonce zeroed by musig_create_partial_sig. INVARIANT holds. */
             if (!factory_session_set_partial_sig(f, nidx, (size_t)slot, &lsp_psig)) {
                 fprintf(stderr, "LSP-stateless: set LSP psig node %zu failed\n", nidx);
                 memset(lsp_seckey, 0, 32);
-                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
                 goto fail_pre;
             }
             musig_partial_sig_serialize(lsp->ctx, lsp_psig_per_node + nidx * 32, &lsp_psig);
@@ -1162,6 +1201,29 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 dist_active = 0;
             }
         }
+        /* End-date payouts: the LSP's nonce, finalize, its partial sig. */
+        for (size_t pi = 0; pi < f->n_payouts; pi++) {
+            int ps = factory_payout_signer_slot(f, pi, 0);
+            secp256k1_musig_secnonce sn;
+            secp256k1_musig_pubnonce pn;
+            secp256k1_musig_partial_sig psig;
+            if (ps < 0 ||
+                !musig_generate_nonce(lsp->ctx, &sn, &pn, lsp_seckey, &lsp->lsp_pubkey,
+                                      &f->payouts[pi].keyagg.cache) ||
+                !factory_payout_session_set_nonce(f, pi, (size_t)ps, &pn) ||
+                !factory_payout_session_finalize(f, pi) ||
+                !musig_create_partial_sig(lsp->ctx, &psig, &sn, &lsp->lsp_keypair,
+                                          &f->payouts[pi].session) ||
+                !factory_payout_session_set_partial_sig(f, pi, (size_t)ps, &psig)) {
+                fprintf(stderr, "LSP-stateless: end-date payout %zu signing failed\n", pi);
+                memset(lsp_seckey, 0, 32);
+                free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn); free(payout_pn);
+                goto fail_pre;
+            }
+            musig_pubnonce_serialize(lsp->ctx,
+                                     payout_pn + factory_payout_nonce_offset(f, pi) + (size_t)ps * 66,
+                                     &pn);
+        }
         memset(lsp_seckey, 0, 32);
 
         /* Step D: LSP_RESPONSE -- per-node LSP nonces + psigs + full matrix. */
@@ -1169,7 +1231,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             lsp_pn_per_node, lsp_psig_per_node, (uint32_t)f->n_nodes,
             all_pn, (uint32_t)(f->n_nodes * mtx_stride));
         free(lsp_pn_per_node); free(lsp_psig_per_node);
-        if (!response) { free(all_pn); goto fail_pre; }
+        if (!response) { free(all_pn); free(payout_pn); goto fail_pre; }
+        if (payout_mtx_len > 0)
+            wire_json_add_hex(response, "payout_pubnonces_all", payout_pn, payout_mtx_len);
+        free(payout_pn);
+        payout_pn = NULL;
         /* #54 G1b: attach dist co-signing fields so clients verify + sign the
            distribution TX this same round.  Omitted when !dist_active -> clients
            see no dist fields and skip dist signing (graceful degrade). */
@@ -1247,6 +1313,28 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 dist_active = 0;
             }
         }
+        {
+            size_t np = factory_payout_count_for_signer(f, my_part);
+            unsigned char *pps = np ? malloc(np * 32) : NULL;
+            int ok = np == 0 || (pps && wire_json_get_hex(pmsg.json, "payout_psigs",
+                                                          pps, np * 32) == (int)(np * 32));
+            for (size_t pi = 0, k = 0; ok && pi < f->n_payouts; pi++) {
+                int ps = factory_payout_signer_slot(f, pi, my_part);
+                if (ps < 0) continue;
+                secp256k1_musig_partial_sig psig;
+                ok = musig_partial_sig_parse(lsp->ctx, &psig, pps + k * 32) &&
+                     factory_payout_session_set_partial_sig(f, pi, (size_t)ps, &psig);
+                k++;
+            }
+            free(pps);
+            if (!ok) {
+                fprintf(stderr, "LSP-stateless: client %zu sent no valid end-date payout "
+                        "partial signatures\n", c);
+                cJSON_Delete(pmsg.json);
+                free(client_psig);
+                goto fail_pre;
+            }
+        }
         cJSON_Delete(pmsg.json);
         for (size_t nidx = 0; nidx < f->n_nodes; nidx++) {
             int slot = factory_find_signer_slot(f, nidx, my_part);
@@ -1279,7 +1367,10 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        Phase D, retry with fresh nonces -- before shipping a dud FACTORY_READY.
        A valid ceremony always passes (no behaviour change); only a genuinely
        invalid aggregate aborts. */
-        if (factory_verify_all(f)) {
+        int payouts_ok = 1;
+        for (size_t pi = 0; pi < f->n_payouts && payouts_ok; pi++)
+            payouts_ok = factory_payout_session_complete(f, pi);
+        if (factory_verify_all(f) && payouts_ok) {
             verify_ok = 1;
             break;  /* aggregate valid -- exit the bounded retry loop */
         }
@@ -1296,14 +1387,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         goto fail_pre;
     }
 
-    /* #54 G1b: aggregate the dist partial sigs into the signed distribution TX
-       (the offline-forever recovery net), setting dist_tx_ready=2 so
-       wire_build_factory_ready ships distribution_tx_hex.  NON-FATAL: the factory
-       is already fully created; on any dist failure we simply ship no signed dist
-       TX (degrades to today's behaviour, no fund risk). */
-    if (dist_active && !factory_session_complete_dist(f))
-        fprintf(stderr, "LSP-stateless: dist co-sign incomplete -- FACTORY_READY "
-                "omits the signed distribution TX (offline-recovery degraded)\n");
+    /* Aggregate the distribution TX (dist_tx_ready=2, shipped in
+       FACTORY_READY).  It is the funding output's end-date spend, as the
+       payouts are for every other shared output, so it is mandatory: without
+       every member's signature over it the factory is not created. */
+    if (!dist_active || !factory_session_complete_dist(f)) {
+        fprintf(stderr, "LSP-stateless: the distribution TX is not co-signed by every "
+                "member -- the factory is not created\n");
+        goto fail_pre;
+    }
 
     /* Gap-scan efficacy cheat (mainnet-inert): simulate a malicious/buggy LSP shipping
        an INVALID tree.  The LSP's own Phase-B factory_verify_all (above) already passed,
@@ -1416,6 +1508,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     unsigned char lsp_seckey[32];
     if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
 
@@ -1425,6 +1518,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                                lsp_seckey, &lsp->lsp_pubkey, &keyagg.cache)) {
         memset(lsp_seckey, 0, 32);
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
     memset(lsp_seckey, 0, 32);
@@ -1688,6 +1782,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID -- "
                 "retryable (fresh-nonce re-run; clients kept)\n");
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 2;
     }
 
@@ -1711,12 +1806,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     }
 
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 1;
 
 close_fail:
     if (clients_notified)
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 0;
 }
 
