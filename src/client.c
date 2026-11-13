@@ -14,6 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -1138,12 +1142,18 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
     uint64_t amount_sats = amount_msat / 1000;
     uint64_t new_id;
 
-    /* If dest_client field is present, we're the sender (LSP is routing
-       our payment). Otherwise we're the receiver. */
-    cJSON *dest = cJSON_GetObjectItem(msg->json, "dest_client");
-    htlc_direction_t dir = dest ? HTLC_OFFERED : HTLC_RECEIVED;
+    /* The direction is ours to know, never the LSP's to say.  An add from
+       the LSP is an HTLC it offers to us.  An HTLC we offer exists only
+       because we sent its add (client_send_payment booked it then), so an
+       add from the LSP claiming to be our payment is refused. */
+    if (cJSON_GetObjectItem(msg->json, "dest_client")) {
+        fprintf(stderr, "Client: PROTOCOL ERROR — UPDATE_ADD_HTLC %llu from "
+                "the LSP claims to be a payment we sent; refused, nothing "
+                "changed\n", (unsigned long long)htlc_id);
+        return 0;
+    }
 
-    if (!channel_add_htlc(ch, dir, amount_sats, payment_hash,
+    if (!channel_add_htlc(ch, HTLC_RECEIVED, amount_sats, payment_hash,
                            cltv_expiry, &new_id))
         return 0;
 
@@ -1191,6 +1201,88 @@ int client_fulfill_payment(int fd, channel_t *ch,
     int ok = wire_send(fd, MSG_UPDATE_FULFILL_HTLC, msg);
     cJSON_Delete(msg);
     return ok;
+}
+
+int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
+                             uint32_t tip_height) {
+    if (!h || h->direction != HTLC_RECEIVED || h->state != HTLC_STATE_ACTIVE)
+        return 0;
+    if (h->amount_sats > UINT64_MAX / 1000 ||
+        h->amount_sats * 1000 < invoice_amount_msat)
+        return 0;
+    if (tip_height == 0 ||
+        (uint64_t)h->cltv_expiry <
+            (uint64_t)tip_height + CLIENT_MIN_FINAL_CLTV_DELTA)
+        return 0;
+    return 1;
+}
+
+int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
+                               const unsigned char *preimage32,
+                               uint64_t invoice_amount_msat,
+                               uint32_t tip_height) {
+    if (!ch || !preimage32) return -1;
+    const htlc_t *h = NULL;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].id == htlc_id &&
+            ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].direction == HTLC_RECEIVED)
+            h = &ch->htlcs[i];
+    if (!h) return -1;
+
+    if (client_htlc_pays_invoice(h, invoice_amount_msat, tip_height))
+        return client_fulfill_payment(fd, ch, htlc_id, preimage32) ? 1 : -1;
+
+    fprintf(stderr, "Client: HTLC %llu does not pay our invoice (%llu msat "
+            "offered, %llu invoiced; expiry %u, tip %u, need %u blocks) -- "
+            "failing it, preimage kept\n", (unsigned long long)htlc_id,
+            (unsigned long long)(h->amount_sats * 1000),
+            (unsigned long long)invoice_amount_msat, h->cltv_expiry,
+            tip_height, (unsigned)CLIENT_MIN_FINAL_CLTV_DELTA);
+    if (!channel_fail_htlc(ch, htlc_id)) return -1;
+    client_check_conservation(ch, "after fail_htlc");
+    cJSON *fail = wire_build_update_fail_htlc(htlc_id,
+                                              "incorrect_or_unknown_payment_details");
+    int ok = fail && wire_send(fd, MSG_UPDATE_FAIL_HTLC, fail);
+    if (fail) cJSON_Delete(fail);
+    return ok ? 0 : -1;
+}
+
+static client_rand_fn g_client_rand_fn = NULL;
+
+void client_set_rand_source(client_rand_fn fn) {
+    g_client_rand_fn = fn;
+}
+
+static int client_os_rand(unsigned char *buf, size_t len) {
+#ifdef __linux__
+    ssize_t got = getrandom(buf, len, 0);
+    if (got == (ssize_t)len) return 1;
+#endif
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = read(fd, buf + off, len - off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        off += (size_t)r;
+    }
+    close(fd);
+    return off == len;
+}
+
+int client_new_invoice_preimage(unsigned char preimage32[32],
+                                unsigned char payment_hash32[32]) {
+    if (!preimage32 || !payment_hash32) return 0;
+    client_rand_fn fn = g_client_rand_fn ? g_client_rand_fn : client_os_rand;
+    if (!fn(preimage32, 32)) {
+        secure_zero(preimage32, 32);
+        memset(payment_hash32, 0, 32);
+        return 0;
+    }
+    sha256(preimage32, 32, payment_hash32);
+    return 1;
 }
 
 /* --- Cooperative close ceremony (extracted for reuse) --- */

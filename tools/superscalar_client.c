@@ -1417,23 +1417,6 @@ handle_message:
                 }
             }
 
-            /* Track routing volume for fee verification.
-               If this HTLC has dest_client (we're the sender), the LSP
-               deducted a routing fee. Track so we can verify settlement. */
-            {
-                cJSON *amt_j = cJSON_GetObjectItem(msg.json, "amount_msat");
-                cJSON *dest_j = cJSON_GetObjectItem(msg.json, "dest_client");
-                if (dest_j && amt_j && cJSON_IsNumber(amt_j) && cbd) {
-                    uint64_t htlc_msat = (uint64_t)amt_j->valuedouble;
-                    uint64_t htlc_sats = htlc_msat / 1000;
-                    cbd->tracked_routed_sats += htlc_sats;
-                    if (cbd->routing_fee_ppm > 0) {
-                        uint64_t fee_msat = (htlc_msat * cbd->routing_fee_ppm
-                                              + 999999) / 1000000;
-                        cbd->tracked_fees_sats += (fee_msat + 999) / 1000;
-                    }
-                }
-            }
             /* ADV Phase 5a (defense-in-depth): for a RECEIVED payment HTLC (not a
                settlement, not us-as-sender), the payment_hash should match an
                invoice WE issued — otherwise we hold the preimage for nothing and
@@ -1460,7 +1443,12 @@ handle_message:
                     }
                 }
             }
-            client_handle_add_htlc(ch, &msg);
+            if (!client_handle_add_htlc(ch, &msg)) {
+                /* refused or not booked: nothing changed, nothing to sign */
+                cJSON_Delete(msg.json);
+                secure_zero(sett_preimage, sizeof(sett_preimage));
+                break;
+            }
             cJSON_Delete(msg.json);
 
             /* Wait for COMMITMENT_SIGNED (5s timeout), handling PTLC_PRESIG
@@ -1545,26 +1533,49 @@ handle_message:
                 if (found) {
                     /* Look up preimage from local invoice store */
                     unsigned char preimage[32];
-                    int have_preimage = 0;
+                    client_invoice_t *paid_inv = NULL;
                     if (cbd) {
                         for (size_t inv = 0; inv < cbd->n_invoices; inv++) {
                             if (cbd->invoices[inv].active &&
                                 memcmp(cbd->invoices[inv].payment_hash, htlc_hash, 32) == 0) {
-                                memcpy(preimage, cbd->invoices[inv].preimage, 32);
-                                cbd->invoices[inv].active = 0;
-                                /* Deactivate in persistence (Phase 23) */
-                                if (cbd->db)
-                                    persist_deactivate_client_invoice(cbd->db, htlc_hash);
-                                have_preimage = 1;
+                                paid_inv = &cbd->invoices[inv];
                                 break;
                             }
                         }
                     }
-                    if (!have_preimage) {
+                    if (!paid_inv) {
                         fprintf(stderr, "Client %u: no preimage for HTLC %llu, failing\n",
                                 my_index, (unsigned long long)htlc_id);
                         break;
                     }
+                    /* The preimage goes out only for an HTLC that pays the
+                       invoice; otherwise the HTLC is failed back and the
+                       invoice stays open. */
+                    {
+                        htlc_t *rh = NULL;
+                        for (size_t h = 0; h < ch->n_htlcs; h++)
+                            if (ch->htlcs[h].id == htlc_id &&
+                                ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                                ch->htlcs[h].direction == HTLC_RECEIVED)
+                                rh = &ch->htlcs[h];
+                        uint32_t tip = client_chain_tip();
+                        if (!client_htlc_pays_invoice(rh, paid_inv->amount_msat,
+                                                      tip)) {
+                            client_settle_invoice_htlc(fd, ch, htlc_id,
+                                paid_inv->preimage, paid_inv->amount_msat,
+                                tip);
+                            if (cbd && cbd->db)
+                                persist_update_channel_balance(cbd->db, my_index - 1,
+                                    ch->local_amount, ch->remote_amount,
+                                    ch->commitment_number);
+                            break;
+                        }
+                    }
+                    memcpy(preimage, paid_inv->preimage, 32);
+                    paid_inv->active = 0;
+                    /* Deactivate in persistence (Phase 23) */
+                    if (cbd->db)
+                        persist_deactivate_client_invoice(cbd->db, htlc_hash);
                     printf("Client %u: fulfilling HTLC %llu with real preimage\n",
                            my_index, (unsigned long long)htlc_id);
 
@@ -1791,21 +1802,18 @@ handle_message:
             if (cbd && cbd->n_invoices < MAX_CLIENT_INVOICES) {
                 client_invoice_t *inv = &cbd->invoices[cbd->n_invoices];
 
-                /* Generate random preimage from /dev/urandom */
-                FILE *urand = fopen("/dev/urandom", "rb");
-                if (urand) {
-                    if (fread(inv->preimage, 1, 32, urand) != 32)
-                        memset(inv->preimage, 0x42, 32); /* fallback */
-                    fclose(urand);
-                } else {
-                    /* Deterministic fallback: derive from index */
-                    memset(inv->preimage, 0x42, 32);
-                    inv->preimage[0] = (unsigned char)cbd->n_invoices;
-                    inv->preimage[1] = (unsigned char)my_index;
+                /* A fresh random preimage, or no invoice at all */
+                if (!client_new_invoice_preimage(inv->preimage,
+                                                 inv->payment_hash)) {
+                    fprintf(stderr, "Client %u: no randomness for an invoice "
+                            "preimage; no invoice created\n", my_index);
+                    cJSON *err = wire_build_error("cannot create invoice");
+                    if (err) {
+                        wire_send(fd, MSG_ERROR, err);
+                        cJSON_Delete(err);
+                    }
+                    break;
                 }
-
-                /* Compute payment_hash = SHA256(preimage) */
-                sha256(inv->preimage, 32, inv->payment_hash);
                 inv->amount_msat = inv_amount_msat;
                 inv->active = 1;
                 cbd->n_invoices++;
