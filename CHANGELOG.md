@@ -20,6 +20,14 @@ Schema v45 (`pending_sweeps` claim columns).
 - **A client that does not revoke after a fulfil fails its channel.** Before an update replaces a client's commitment, the HTLCs the client offered on it are watched, so a preimage learned later arms a claim there too. A missing `revoke_and_ack` after a fulfil now fails the channel, as an invalid one already did; a failed channel is not revealed any further preimage, and its HTLCs are claimed from whichever commitment it broadcasts.
 - **A payee that stalls after its fulfil no longer stops the payment.** The LSP holds the preimage, so the sender is fulfilled upstream even when the payee does not complete the commitment exchange.
 
+### A member decides its HTLCs from its own state
+
+Operator-visible behaviour changes.
+
+- **An add from the LSP is always an incoming HTLC.** A member books an HTLC as its own (offered) only when it sent the add itself (`client_send_payment`). `client_handle_add_htlc` refuses an `UPDATE_ADD_HTLC` from the LSP that claims to be the member's own payment (it carries `dest_client`): nothing is booked and no balance changes, and the client daemon signs nothing for it. A payment the LSP starts on a member's behalf (`--demo` payments, `rebalance`, CLI `pay`, all through `lsp_channels_initiate_payment`) therefore no longer completes; member-initiated payments, `lsppay` and invoice payments are unchanged.
+- **The preimage goes out only for an HTLC that pays the invoice.** Before it fulfils, the client daemon requires the HTLC to carry at least the invoiced amount (BOLT 4: never less) and to expire at least `CLIENT_MIN_FINAL_CLTV_DELTA` (18) blocks after its own chain tip (`client_htlc_pays_invoice`, `client_settle_invoice_htlc`). Otherwise it fails the HTLC back with `incorrect_or_unknown_payment_details`, keeps the preimage and leaves the invoice open. Without a chain tip the HTLC is failed.
+- **No invoice without fresh randomness.** Invoice preimages come from `getrandom`, else `/dev/urandom` (`client_new_invoice_preimage`). If neither can be read, no invoice is created and the client answers the LSP's `CREATE_INVOICE` with `MSG_ERROR`; the fixed fallback preimage is gone.
+
 ### Reorg handling fixes (#201, #206, #210)
 
 - **False reorgs:** the tip height and hash were read with two RPCs, so a block arriving between them produced a mismatched pair and a later `FORWARD_REORG` that never happened. Both now come from one `getblockchaininfo` call (`regtest_get_tip`), and classification is a pure function (`lsp_reorg_classify`).
@@ -180,6 +188,11 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - Each input the client signs is now checked against `client_ps_signed_inputs` before any nonce and recorded (one row per input, the leaf's fail-closed rules) before the partial sigs are sent: a different spend of a recorded outpoint is refused, the identical retry is idempotent, and a failure on any input aborts with nothing sent.
 - A `PROPOSE_INTENT` whose `n_inputs` is not the chain tx's input count, or whose `subfactory_id` is not the sub-factory that `(leaf_side, sub_idx)` names, is refused before any local change. The single-input sub-factory ceremony, which signed, with no record, a message that is not the sighash of any input of the chain tx, is removed.
 - New client crash checkpoints `ps_sub_record_pre_save`, `ps_sub_record_post_save`, `ps_sub_record_post_final`. Tests in `tests/test_ps_subfactory_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Sub-factory chain advances: per-input record".
+
+### Reconnect after a half-finished forward
+
+- **The LSP replays a pending forward to a reconnecting member in msat.**  The replayed `UPDATE_ADD_HTLC` carried the amount in sat in the msat field, so the member read 1500 sat as 1 sat, refused the HTLC and its commitment, and the channel stayed a commitment ahead of the member: every later payment to or from it failed.
+- **A replay that does not complete is undone.**  The destination channel goes back to the persisted state (amounts, HTLCs, commitment number), the replayed HTLC row is removed and the connection is dropped, so the member's next reconnect replays the forward again from a consistent point.  Before, the channel was left a commitment ahead with an HTLC the member never took.
 
 ## v0.2.0 — 2026-07-02
 
