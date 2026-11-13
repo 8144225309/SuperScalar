@@ -228,7 +228,12 @@ run_scenario(){
     echo
     echo "--- scenario $MODE ---"
 
+    # A factory that lives long enough for the payment HTLC to reach the
+    # payee with its final CLTV margin to spare: the payee refuses an HTLC
+    # that expires within CLIENT_MIN_FINAL_CLTV_DELTA blocks of its tip, and
+    # the regtest default lifetime (20 + 10 blocks) leaves no such margin.
     local LSP_ARGS=(--network regtest --port "$LPORT" --lsp-balance-pct 50 --clients 2
+        --active-blocks 400
         ${ARITY_ARGS[@]+"${ARITY_ARGS[@]}"} --amount "$AMOUNT" --fee-rate "$FEE" --confirm-timeout 600
         --seckey "$LSP_SECKEY" "${RPC_ARGS[@]}" --wallet "$WALLET" --db "$D/lsp.db")
     local LSP_RUN=(--payments 1)

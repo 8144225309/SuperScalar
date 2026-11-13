@@ -6,6 +6,14 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### A member decides its HTLCs from its own state
+
+Operator-visible behaviour changes.
+
+- **An add from the LSP is always an incoming HTLC.** A member books an HTLC as its own (offered) only when it sent the add itself (`client_send_payment`). `client_handle_add_htlc` refuses an `UPDATE_ADD_HTLC` from the LSP that claims to be the member's own payment (it carries `dest_client`): nothing is booked and no balance changes, and the client daemon signs nothing for it. A payment the LSP starts on a member's behalf (`--demo` payments, `rebalance`, CLI `pay`, all through `lsp_channels_initiate_payment`) therefore no longer completes; member-initiated payments, `lsppay` and invoice payments are unchanged.
+- **The preimage goes out only for an HTLC that pays the invoice.** Before it fulfils, the client daemon requires the HTLC to carry at least the invoiced amount (BOLT 4: never less) and to expire at least `CLIENT_MIN_FINAL_CLTV_DELTA` (18) blocks after its own chain tip (`client_htlc_pays_invoice`, `client_settle_invoice_htlc`). Otherwise it fails the HTLC back with `incorrect_or_unknown_payment_details`, keeps the preimage and leaves the invoice open. Without a chain tip the HTLC is failed.
+- **No invoice without fresh randomness.** Invoice preimages come from `getrandom`, else `/dev/urandom` (`client_new_invoice_preimage`). If neither can be read, no invoice is created and the client answers the LSP's `CREATE_INVOICE` with `MSG_ERROR`; the fixed fallback preimage is gone.
+
 ### Reorg handling fixes (#201, #206, #210)
 
 - **False reorgs:** the tip height and hash were read with two RPCs, so a block arriving between them produced a mismatched pair and a later `FORWARD_REORG` that never happened. Both now come from one `getblockchaininfo` call (`regtest_get_tip`), and classification is a pure function (`lsp_reorg_classify`).
