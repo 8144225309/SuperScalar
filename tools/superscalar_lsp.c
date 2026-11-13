@@ -56,6 +56,39 @@
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+
+/* --invoice-route-hint, applied to the channel manager once it exists */
+static wire_route_hint_t g_invoice_hint;
+static int g_has_invoice_hint = 0;
+
+/* "NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA" (SCID decimal or BxTxO) */
+static int parse_invoice_route_hint(const char *arg, wire_route_hint_t *h) {
+    char buf[256];
+    if (!arg || strlen(arg) >= sizeof(buf)) return 0;
+    strcpy(buf, arg);
+    char *f[5];
+    int n = 0;
+    for (char *t = strtok(buf, "/"); t && n < 5; t = strtok(NULL, "/"))
+        f[n++] = t;
+    if (n != 5 || strlen(f[0]) != 66 || hex_decode(f[0], h->node_id, 33) != 33)
+        return 0;
+    unsigned long long b, tx, o;
+    if (sscanf(f[1], "%llux%llux%llu", &b, &tx, &o) == 3)
+        h->scid = (b << 40) | (tx << 16) | o;
+    else {
+        char *end = NULL;
+        h->scid = strtoull(f[1], &end, 10);
+        if (!end || *end) return 0;
+    }
+    char *e1 = NULL, *e2 = NULL, *e3 = NULL;
+    unsigned long fb = strtoul(f[2], &e1, 10), fp = strtoul(f[3], &e2, 10),
+                  cd = strtoul(f[4], &e3, 10);
+    if (*e1 || *e2 || *e3 || cd > 0xffff) return 0;
+    h->fee_base_msat = (uint32_t)fb;
+    h->fee_ppm = (uint32_t)fp;
+    h->cltv_delta = (uint16_t)cd;
+    return 1;
+}
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 #include "superscalar/bolt12.h"
@@ -207,6 +240,11 @@ static void usage(const char *prog) {
         "  --payments N        Number of HTLC payments to process (default 0)\n"
         "  --daemon            Run as long-lived daemon (Ctrl+C for graceful close)\n"
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
+        "  --invoice-route-hint NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA\n"
+        "                      The last hop member invoices advertise: this LSP's Lightning\n"
+        "                      node and the channel id it forwards member payments on.  A\n"
+        "                      member signs its own invoices through it and keeps their\n"
+        "                      preimages; the LSP sees only the payment hash.\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
         "  --tree-fee-rate N   Rate in sat/kvB every pre-signed factory tx pays (tree nodes,\n"
@@ -1958,6 +1996,14 @@ int main(int argc, char *argv[]) {
                persistence + revocation_secrets must survive. */
             setenv("SS_KILL_AFTER_STATE_ADVANCE", "1", 1);
         }
+        else if (strcmp(argv[i], "--invoice-route-hint") == 0 && i + 1 < argc) {
+            if (!parse_invoice_route_hint(argv[++i], &g_invoice_hint)) {
+                fprintf(stderr, "LSP: invalid --invoice-route-hint "
+                        "(NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA)\n");
+                return 1;
+            }
+            g_has_invoice_hint = 1;
+        }
         else if (strcmp(argv[i], "--bridge-pubkey") == 0 && i + 1 < argc) {
             const char *hex = argv[++i];
             unsigned char ser[33];
@@ -3278,6 +3324,8 @@ int main(int argc, char *argv[]) {
             mgr->persist = &db;
             mgr->confirm_timeout_secs = confirm_timeout_secs;
             mgr->heartbeat_interval = heartbeat_interval;
+            mgr->invoice_hint = g_invoice_hint;
+            mgr->has_invoice_hint = g_has_invoice_hint;
 
             /* Load persisted state: invoices, HTLC origins, request_id */
             mgr->next_request_id = persist_load_counter(&db, "next_request_id", 1);
@@ -3740,6 +3788,8 @@ accept_new_factory:
             g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
             memcpy(g_ln_dispatch.our_privkey, lsp_p->nk_seckey, 32);
             g_ln_dispatch.invoices = &g_invoice_tbl;
+            g_ln_dispatch.member_hint_scid =
+                g_has_invoice_hint ? g_invoice_hint.scid : 0;
 
             /* Wire LSPS0 callback */
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
@@ -4584,6 +4634,8 @@ accept_new_factory:
             secp256k1_context_destroy(ctx);
             return 1;
         }
+        mgr->invoice_hint = g_invoice_hint;
+        mgr->has_invoice_hint = g_has_invoice_hint;
         if (!lsp_channels_exchange_basepoints(mgr, lsp_p)) {
             fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_cleanup(lsp_p);

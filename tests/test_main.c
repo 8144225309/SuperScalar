@@ -235,6 +235,7 @@ extern int test_ln_dispatch_routes_revoke_and_ack(void);
 extern int test_ln_dispatch_routes_update_fee(void);
 extern int test_ln_dispatch_routes_channel_reestablish(void);
 extern int test_ln_dispatch_flush_relay_empty(void);
+extern int test_ln_dispatch_member_forward_refused(void);
 extern int test_ln_dispatch_routes_shutdown(void);
 extern int test_ln_dispatch_routes_closing_signed(void);
 extern int test_ln_dispatch_shutdown_state_recv(void);
@@ -1470,6 +1471,9 @@ extern int test_reconnect_htlc_replay(void);
 extern int test_member_host_add_is_never_own_payment(void);
 extern int test_member_underpaid_htlc_gets_no_preimage(void);
 extern int test_member_invoice_preimage_needs_randomness(void);
+extern int test_member_final_hop_onion(void);
+extern int test_member_external_payment_rules(void);
+extern int test_member_signs_its_own_invoice(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
 /* Security hardening */
@@ -1892,13 +1896,13 @@ extern int test_tor_password_file(void);
 
 /* Keysend (Signet/Testnet4 Gap) */
 extern int test_bridge_keysend_inbound(void);
+extern int test_bridge_member_offline_htlc_held(void);
+extern int test_bridge_held_htlc_offered_on_reconnect(void);
 
 /* Signet/Testnet4 Gap Stress Tests */
-extern int test_prop_keysend_wire_roundtrip(void);
 extern int test_prop_keysend_preimage_verify(void);
 extern int test_prop_rebalance_conservation(void);
 extern int test_prop_invoice_registry_exhaustion(void);
-extern int test_prop_keysend_bridge_e2e(void);
 extern int test_prop_cli_command_fuzzing(void);
 extern int test_prop_batch_rebalance_partial_fail(void);
 extern int test_prop_keysend_invoice_collision(void);
@@ -2346,6 +2350,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ln_dispatch_routes_update_fee);
     RUN_TEST(test_ln_dispatch_routes_channel_reestablish);
     RUN_TEST(test_ln_dispatch_flush_relay_empty);
+    RUN_TEST(test_ln_dispatch_member_forward_refused);
 
     printf("\n=== Phase 1: Cooperative Close Dispatch ===\n");
     RUN_TEST(test_ln_dispatch_routes_shutdown);
@@ -3451,6 +3456,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
     RUN_TEST(test_bridge_keysend_inbound);
+    RUN_TEST(test_bridge_member_offline_htlc_held);
+    RUN_TEST(test_bridge_held_htlc_offered_on_reconnect);
     RUN_TEST(test_bridge_outbound_budget);
     RUN_TEST(test_bridge_outbound_invoice_check);
     RUN_TEST(test_bridge_pay_request_carries_limits);
@@ -3613,6 +3620,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_member_host_add_is_never_own_payment);
     RUN_TEST(test_member_underpaid_htlc_gets_no_preimage);
     RUN_TEST(test_member_invoice_preimage_needs_randomness);
+    RUN_TEST(test_member_final_hop_onion);
+    RUN_TEST(test_member_external_payment_rules);
+    RUN_TEST(test_member_signs_its_own_invoice);
     RUN_TEST(test_client_handle_async_msg);
 
     printf("\n=== Security Hardening ===\n");
@@ -4017,11 +4027,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_prop_wire_register_roundtrip);
 
     printf("\n=== Signet/Testnet4 Gap Stress Tests ===\n");
-    RUN_TEST(test_prop_keysend_wire_roundtrip);
     RUN_TEST(test_prop_keysend_preimage_verify);
     RUN_TEST(test_prop_rebalance_conservation);
     RUN_TEST(test_prop_invoice_registry_exhaustion);
-    RUN_TEST(test_prop_keysend_bridge_e2e);
     RUN_TEST(test_prop_cli_command_fuzzing);
     RUN_TEST(test_prop_batch_rebalance_partial_fail);
     RUN_TEST(test_prop_keysend_invoice_collision);

@@ -304,6 +304,11 @@ static const char *SCHEMA_SQL =
     "  upstream_id TEXT NOT NULL DEFAULT '',"
     "  fail_pending INTEGER DEFAULT 0"
     ");"
+    "CREATE TABLE IF NOT EXISTS held_inbound ("
+    "  origin_id INTEGER PRIMARY KEY,"
+    "  amount_msat INTEGER NOT NULL,"
+    "  onion TEXT"
+    ");"
     "CREATE TABLE IF NOT EXISTS client_invoices ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payment_hash TEXT NOT NULL,"
@@ -1550,6 +1555,15 @@ int persist_open(persist_t *p, const char *path) {
             p->db = NULL;
             return 0;
         }
+    }
+
+    /* v45: a member's BOLT 11 invoices carry a payment secret, which the
+       member checks a payment against (NULL for an invoice paid inside the
+       factory).  Version-gated (ALTER is not idempotent). */
+    if (db_version < 45) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE client_invoices ADD COLUMN payment_secret TEXT;",
+            NULL, NULL, NULL);
     }
 
     /* Record the current version if not already present */
@@ -5993,6 +6007,70 @@ int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
     return found;
 }
 
+int persist_save_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t amount_msat,
+                              const unsigned char *onion, size_t onion_len) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO held_inbound (origin_id, amount_msat, onion) "
+        "VALUES (?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)amount_msat);
+    char *hex = NULL;
+    if (onion && onion_len) {
+        hex = malloc(onion_len * 2 + 1);
+        if (!hex) { sqlite3_finalize(stmt); return 0; }
+        hex_encode(onion, onion_len, hex);
+        sqlite3_bind_text(stmt, 3, hex, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 3);
+    }
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_delete_held_inbound(persist_t *p, int64_t row_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql = "DELETE FROM held_inbound WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t *amount_msat_out,
+                              unsigned char *onion_out, size_t onion_cap,
+                              int *has_onion_out) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "SELECT amount_msat, onion FROM held_inbound WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        if (amount_msat_out)
+            *amount_msat_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
+        int has = hex && onion_out && strlen(hex) == onion_cap * 2 &&
+                  hex_decode(hex, onion_out, onion_cap) == (int)onion_cap;
+        if (has_onion_out) *has_onion_out = has;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id) {
     if (!p || !p->db || row_id <= 0) return 0;
     const char *sql = "UPDATE htlc_origins SET active = 0 WHERE id = ?;";
@@ -6063,16 +6141,19 @@ size_t persist_load_htlc_origins_ids(persist_t *p,
 int persist_save_client_invoice(persist_t *p,
                                  const unsigned char *payment_hash32,
                                  const unsigned char *preimage32,
+                                 const unsigned char *payment_secret32,
                                  uint64_t amount_msat) {
     if (!p || !p->db || !payment_hash32 || !preimage32) return 0;
 
-    char hash_hex[65], preimage_hex[65];
+    char hash_hex[65], preimage_hex[65], secret_hex[65];
     hex_encode(payment_hash32, 32, hash_hex);
     hex_encode(preimage32, 32, preimage_hex);
+    if (payment_secret32) hex_encode(payment_secret32, 32, secret_hex);
 
     const char *sql =
         "INSERT INTO client_invoices "
-        "(payment_hash, preimage, amount_msat) VALUES (?, ?, ?);";
+        "(payment_hash, preimage, amount_msat, payment_secret) "
+        "VALUES (?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -6081,9 +6162,15 @@ int persist_save_client_invoice(persist_t *p,
     sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, preimage_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 3, (sqlite3_int64)amount_msat);
+    if (payment_secret32)
+        sqlite3_bind_text(stmt, 4, secret_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 4);
 
     int ok8 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    secure_zero(preimage_hex, sizeof(preimage_hex));
+    secure_zero(secret_hex, sizeof(secret_hex));
     return ok8;
 }
 
@@ -6112,12 +6199,14 @@ int persist_deactivate_client_invoice(persist_t *p,
 size_t persist_load_client_invoices(persist_t *p,
                                      unsigned char (*hashes_out)[32],
                                      unsigned char (*preimages_out)[32],
+                                     unsigned char (*secrets_out)[32],
+                                     int *has_secret_out,
                                      uint64_t *amounts_out,
                                      size_t max_invoices) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT payment_hash, preimage, amount_msat "
+        "SELECT payment_hash, preimage, amount_msat, payment_secret "
         "FROM client_invoices WHERE active = 1 ORDER BY id;";
 
     sqlite3_stmt *stmt;
@@ -6134,6 +6223,11 @@ size_t persist_load_client_invoices(persist_t *p,
             hex_decode(preimage_hex, preimages_out[count], 32);
         if (amounts_out)
             amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        const char *secret_hex = (const char *)sqlite3_column_text(stmt, 3);
+        int has_secret = secret_hex && secrets_out &&
+                         hex_decode(secret_hex, secrets_out[count], 32) == 32;
+        if (secrets_out && !has_secret) memset(secrets_out[count], 0, 32);
+        if (has_secret_out) has_secret_out[count] = has_secret;
         count++;
     }
 

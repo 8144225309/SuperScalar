@@ -6118,32 +6118,38 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     case MSG_REGISTER_INVOICE: {
+        /* The hash of a member invoice; the member keeps the preimage (a
+           REGISTER_INVOICE that offers one is refused by the parser). */
         unsigned char payment_hash[32];
-        unsigned char preimage[32];
         uint64_t amount_msat;
         size_t dest_client;
-        if (!wire_parse_register_invoice(msg->json, payment_hash, preimage,
-                                           &amount_msat, &dest_client))
+        if (!wire_parse_register_invoice(msg->json, payment_hash,
+                                           &amount_msat, &dest_client)) {
+            fprintf(stderr, "LSP: REGISTER_INVOICE from client %zu refused "
+                    "(malformed, or it carries a preimage)\n", client_idx);
             return 0;
+        }
+        /* Only for itself: a member cannot have payments routed to another */
+        if (dest_client != client_idx) {
+            fprintf(stderr, "LSP: REGISTER_INVOICE from client %zu names "
+                    "client %zu; refused\n", client_idx, dest_client);
+            return 1;
+        }
         /* A hash with an HTLC in flight, or one already paid in either
-           direction, cannot become an invoice: tell the client there will
-           be none (an empty BOLT11 string). */
+           direction, cannot become an invoice. */
         if (lsp_channels_hash_spent_or_busy(mgr, payment_hash)) {
             fprintf(stderr, "LSP: register_invoice from client %zu refused — "
                     "payment hash is in use or already paid\n", client_idx);
-            cJSON *none = wire_build_invoice_bolt11(payment_hash, "");
-            wire_send(lsp->client_fds[client_idx], MSG_INVOICE_BOLT11, none);
-            cJSON_Delete(none);
             return 1;
         }
-        if (!lsp_channels_register_invoice(mgr, payment_hash, preimage,
+        if (!lsp_channels_register_invoice(mgr, payment_hash,
                                              dest_client, amount_msat)) {
             fprintf(stderr, "LSP: register_invoice failed\n");
             return 0;
         }
-        /* Also forward to bridge if connected */
+        /* Also tell the bridge the hash if connected */
         if (mgr->bridge_fd >= 0) {
-            cJSON *reg = wire_build_bridge_register(payment_hash, preimage,
+            cJSON *reg = wire_build_bridge_register(payment_hash,
                                                       amount_msat, dest_client);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
             cJSON_Delete(reg);
@@ -6948,6 +6954,9 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
     if (lsp->client_fds[c] < 0) return 0;   /* a replay failed: the client reconnects again */
+    /* ...and the inbound HTLCs held for it while it was away */
+    lsp_channels_replay_held_inbound(mgr, lsp, c);
+    if (lsp->client_fds[c] < 0) return 0;
 
     if (mgr->readiness)
         readiness_set_connected((readiness_tracker_t *)mgr->readiness,
@@ -7610,15 +7619,17 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             if (client >= mgr->n_channels) {
                 printf("CLI: invalid client index (max %zu)\n",
                        mgr->n_channels - 1);
-            } else if (mgr->bridge_fd < 0) {
-                printf("CLI: no bridge connected\n");
+            } else if (!mgr->has_invoice_hint) {
+                printf("CLI: no --invoice-route-hint configured\n");
             } else {
                 printf("CLI: creating external invoice for client %u (%llu msat)\n",
                        client, amt);
                 fflush(stdout);
+                char b11[2048];
                 if (lsp_channels_create_external_invoice(mgr, lsp,
-                        (size_t)client, (uint64_t)amt))
-                    printf("CLI: external invoice created\n");
+                        (size_t)client, (uint64_t)amt, b11, sizeof(b11)))
+                    printf("CLI: external invoice created (signed by client %u):\n%s\n",
+                           client, b11);
                 else
                     printf("CLI: external invoice FAILED\n");
             }

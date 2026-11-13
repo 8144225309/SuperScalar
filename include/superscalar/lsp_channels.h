@@ -120,9 +120,10 @@ typedef struct {
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
 #define MAX_INVOICE_REGISTRY 256
 
+/* A member invoice the LSP routes payments to: the hash only.  The member
+   keeps the preimage and releases it when it settles the payment. */
 typedef struct {
     unsigned char payment_hash[32];
-    unsigned char preimage[32];
     size_t dest_client;
     uint64_t amount_msat;
     uint64_t bridge_htlc_id;     /* correlation ID for bridge response */
@@ -151,6 +152,14 @@ typedef struct {
                                    the origin) */
     int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
+    /* inbound: the client was not connected when the HTLC came in.  It is
+       held here (with what is needed to offer it: the amount and the
+       payer's onion for the client), offered when the client reconnects,
+       or failed back before it expires.  The LSP never settles it. */
+    int held;
+    uint64_t amount_msat;
+    int has_onion;
+    unsigned char onion[ONION_WIRE_SIZE];
 } htlc_origin_t;
 
 /* Reorg detection (R1).  See lsp_reorg_poll() below. */
@@ -214,6 +223,11 @@ typedef struct {
 
     /* Bridge support (Phase 14) */
     int bridge_fd;               /* -1 if no bridge connected */
+    /* The last hop member invoices advertise (the LSP's Lightning node and
+       the channel id it forwards member payments on); has_invoice_hint=0
+       until configured (--invoice-route-hint). */
+    wire_route_hint_t invoice_hint;
+    int has_invoice_hint;
     invoice_entry_t *invoices;
     size_t n_invoices;
     size_t invoices_cap;
@@ -871,10 +885,15 @@ uint32_t lsp_channels_chain_height(const lsp_channel_mgr_t *mgr);
 int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
                                uint64_t *request_id_out, const char **err_out);
 
-/* Register an invoice (payment_hash → dest_client) for bridge inbound routing. */
+/* Offer the inbound HTLCs held for client_idx while it was away (it has
+   just reconnected).  Returns how many were offered. */
+size_t lsp_channels_replay_held_inbound(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        size_t client_idx);
+
+/* Register a member invoice (payment_hash → dest_client) for inbound
+   routing.  The LSP holds no preimage for it. */
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
-                                    const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat);
 
 /* Look up invoice by payment_hash. Returns dest_client index, or -1. */
@@ -1048,12 +1067,15 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                           size_t to_client, uint64_t amount_sats);
 
-/* Create an external invoice so a client can receive from the LN via bridge.
-   Sends MSG_CREATE_INVOICE, waits for MSG_INVOICE_CREATED, drains
-   MSG_REGISTER_INVOICE, and forwards MSG_BRIDGE_REGISTER to bridge.
-   Returns 1 on success. */
+/* Ask a member for an invoice outside payers can pay.  The member signs a
+   BOLT 11 invoice with its own key, routed through mgr->invoice_hint (the
+   LSP's Lightning node), and keeps the preimage and payment secret.  The
+   LSP registers the hash, tells the bridge (if any) the hash, and copies
+   the member's invoice to bolt11_out.  Returns 1 on success; 0 without a
+   configured route hint. */
 int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
-                                          size_t client_idx, uint64_t amount_msat);
+                                          size_t client_idx, uint64_t amount_msat,
+                                          char *bolt11_out, size_t bolt11_cap);
 
 /* Run a scripted demo sequence of payments after channels are ready.
    Returns 1 on success. */

@@ -536,12 +536,42 @@ int client_fulfill_payment(int fd, channel_t *ch,
    an invoice (BOLT 11 default min_final_cltv_expiry). */
 #define CLIENT_MIN_FINAL_CLTV_DELTA 18u
 
-/* 1 if h, an active HTLC the LSP offered to us, pays an invoice of
-   invoice_amount_msat (0: any amount): it carries at least that amount
-   (BOLT 4: a final node may be paid more, never less) and expires at least
-   CLIENT_MIN_FINAL_CLTV_DELTA blocks after tip_height.  0 when the tip is
-   not known (tip_height 0). */
+/* What the onion of an incoming HTLC says to us, its final hop. */
+typedef struct {
+    int present;                 /* the add carried an onion */
+    uint64_t amt_to_forward;     /* msat */
+    uint32_t outgoing_cltv;
+    int has_payment_data;
+    unsigned char payment_secret[32];
+    uint64_t total_msat;
+} client_final_hop_t;
+
+/* Decode the onion an UPDATE_ADD_HTLC carried for payment_hash with our
+   node key (BOLT 4: HMAC over the payment hash checked, last hop).
+   1 and *out filled on success.  0 if it is not a valid final-hop onion for
+   us; *out then says an onion came (present) with no payment data, which
+   pays no invoice. */
+int client_decode_final_hop(secp256k1_context *ctx,
+                            const unsigned char node_seckey32[32],
+                            const unsigned char onion[1366],
+                            const unsigned char payment_hash32[32],
+                            client_final_hop_t *out);
+
+/* 1 if h, an active HTLC the LSP offered to us, pays our invoice of
+   invoice_amount_msat (0: any amount):
+   - it carries at least that amount (BOLT 4: a final node may be paid
+     more, never less) and expires at least CLIENT_MIN_FINAL_CLTV_DELTA
+     blocks after tip_height (0 when the tip is not known);
+   - for an invoice with a payment secret (invoice_secret32 non-NULL, a
+     BOLT 11 invoice this member signed), its onion (hop) decoded for us
+     and names that secret, the payment is a single part (total_msat ==
+     amt_to_forward), total_msat is at least the invoice amount, and the
+     HTLC carries at least what the onion says and expires no sooner;
+   - for an invoice without one (made for a payment inside the factory),
+     no onion came with it. */
 int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
+                             const unsigned char *invoice_secret32,
+                             const client_final_hop_t *hop,
                              uint32_t tip_height);
 
 /* Settle received HTLC htlc_id against our invoice: if it pays the invoice
@@ -551,6 +581,8 @@ int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
 int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
                                const unsigned char *preimage32,
                                uint64_t invoice_amount_msat,
+                               const unsigned char *invoice_secret32,
+                               const client_final_hop_t *hop,
                                uint32_t tip_height);
 
 /* A fresh invoice preimage and its payment hash, from the OS randomness

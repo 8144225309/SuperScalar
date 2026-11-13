@@ -63,6 +63,11 @@ typedef struct {
     const char *scb_path;
     circuit_breaker_t     *cb;           /* per-peer HTLC limits; NULL=disabled */
     const char            *network;      /* "mainnet"/"signet"/"testnet"; NULL=mainnet */
+    /* The channel id member invoices advertise as their last hop
+       (--invoice-route-hint); 0 = none.  This node holds no member
+       preimage and never settles a member's payment: a forward on this
+       channel id is failed back to the peer it came from. */
+    uint64_t               member_hint_scid;
 } ln_dispatch_t;
 
 /*

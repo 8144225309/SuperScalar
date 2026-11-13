@@ -133,6 +133,13 @@ static size_t decode_bigsize(const unsigned char *buf, size_t buf_len,
 
 /* ---- TLV stream parser ---- */
 
+/* A big-endian integer of len bytes (0..8) */
+static uint64_t read_tu(const unsigned char *v, size_t len) {
+    uint64_t x = 0;
+    for (size_t i = 0; i < len; i++) x = (x << 8) | v[i];
+    return x;
+}
+
 int onion_parse_tlv_payload(const unsigned char *payload, size_t payload_len,
                              onion_hop_payload_t *out) {
     if (!payload || !out) return 0;
@@ -157,32 +164,25 @@ int onion_parse_tlv_payload(const unsigned char *payload, size_t payload_len,
         off += (size_t)length;
 
         switch (type) {
-        case 2: /* amt_to_forward: u64 BE */
-            if (length == 8) {
-                out->amt_to_forward = ((uint64_t)val[0] << 56)
-                    | ((uint64_t)val[1] << 48) | ((uint64_t)val[2] << 40)
-                    | ((uint64_t)val[3] << 32) | ((uint64_t)val[4] << 24)
-                    | ((uint64_t)val[5] << 16) | ((uint64_t)val[6] <<  8)
-                    |  (uint64_t)val[7];
+        /* BOLT 4 writes these as truncated integers (tu64 / tu32: big
+           endian, no leading zero bytes), so any length up to the full
+           width is read. */
+        case 2: /* amt_to_forward: tu64 */
+            if (length <= 8) {
+                out->amt_to_forward = read_tu(val, (size_t)length);
                 out->has_amt = 1;
             }
             break;
-        case 4: /* outgoing_cltv_value: u32 BE */
-            if (length == 4) {
-                out->outgoing_cltv_value = ((uint32_t)val[0] << 24)
-                    | ((uint32_t)val[1] << 16) | ((uint32_t)val[2] << 8)
-                    |  (uint32_t)val[3];
+        case 4: /* outgoing_cltv_value: tu32 */
+            if (length <= 4) {
+                out->outgoing_cltv_value = (uint32_t)read_tu(val, (size_t)length);
                 out->has_cltv = 1;
             }
             break;
-        case 8: /* payment_data: payment_secret(32) || total_msat(8) */
-            if (length == 40) {
+        case 8: /* payment_data: payment_secret(32) || total_msat (tu64) */
+            if (length >= 32 && length <= 40) {
                 memcpy(out->payment_secret, val, 32);
-                out->total_msat = ((uint64_t)val[32] << 56)
-                    | ((uint64_t)val[33] << 48) | ((uint64_t)val[34] << 40)
-                    | ((uint64_t)val[35] << 32) | ((uint64_t)val[36] << 24)
-                    | ((uint64_t)val[37] << 16) | ((uint64_t)val[38] <<  8)
-                    |  (uint64_t)val[39];
+                out->total_msat = read_tu(val + 32, (size_t)length - 32);
                 out->has_payment_data = 1;
             }
             break;
@@ -250,4 +250,46 @@ int onion_last_hop_decrypt(secp256k1_context *ctx,
     /* Parse TLV payload */
     return onion_parse_tlv_payload(plain + hdr_bytes, (size_t)payload_len,
                                    payload_out);
+}
+
+int onion_final_hop_decode(secp256k1_context *ctx,
+                           const unsigned char node_priv32[32],
+                           const unsigned char onion_packet[ONION_PACKET_SIZE],
+                           const unsigned char *assoc_data, size_t assoc_len,
+                           onion_hop_payload_t *payload_out) {
+    if (!ctx || !node_priv32 || !onion_packet || !payload_out ||
+        (!assoc_data && assoc_len)) return 0;
+    if (onion_packet[0] != 0x00) return 0;
+
+    const unsigned char *eph = onion_packet + 1;
+    const unsigned char *hops = onion_packet + 34;
+    const unsigned char *hmac = onion_packet + 34 + ONION_HOPS_DATA_SIZE;
+
+    unsigned char ss[32], mu[32], rho[32], expect[32];
+    if (!onion_ecdh_shared_secret(ctx, node_priv32, eph, ss)) return 0;
+    generate_key("mu", ss, mu);
+
+    unsigned char *mac_in = (unsigned char *)malloc(ONION_HOPS_DATA_SIZE + assoc_len);
+    if (!mac_in) return 0;
+    memcpy(mac_in, hops, ONION_HOPS_DATA_SIZE);
+    if (assoc_len) memcpy(mac_in + ONION_HOPS_DATA_SIZE, assoc_data, assoc_len);
+    hmac_sha256(expect, mu, 32, mac_in, ONION_HOPS_DATA_SIZE + assoc_len);
+    free(mac_in);
+    unsigned char diff = 0;
+    for (int i = 0; i < 32; i++) diff |= (unsigned char)(expect[i] ^ hmac[i]);
+    if (diff) return 0;
+
+    generate_key("rho", ss, rho);
+    unsigned char plain[ONION_HOPS_DATA_SIZE];
+    if (!onion_xor_stream(hops, ONION_HOPS_DATA_SIZE, rho, plain)) return 0;
+
+    uint64_t plen;
+    size_t hdr = decode_bigsize(plain, ONION_HOPS_DATA_SIZE, &plen);
+    if (hdr == 0 || plen == 0 || hdr + plen + 32 > ONION_HOPS_DATA_SIZE) return 0;
+    /* the last hop: no packet follows */
+    for (size_t i = 0; i < 32; i++)
+        if (plain[hdr + plen + i] != 0) return 0;
+
+    memset(payload_out, 0, sizeof(*payload_out));
+    return onion_parse_tlv_payload(plain + hdr, (size_t)plen, payload_out);
 }

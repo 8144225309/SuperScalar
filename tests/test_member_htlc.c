@@ -5,6 +5,10 @@
 #include "superscalar/channel.h"
 #include "superscalar/wire.h"
 #include "superscalar/sha256.h"
+#include "superscalar/invoice.h"
+#include "superscalar/bolt11.h"
+#include "test_onion_util.h"
+#include <secp256k1_extrakeys.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -136,7 +140,7 @@ int test_member_underpaid_htlc_gets_no_preimage(void) {
         int sv[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
         int r = client_settle_invoice_htlc(sv[0], &ch, 3, pre, invoice_msat,
-                                           cases[i].tip);
+                                           NULL, NULL, cases[i].tip);
         int kind = sent_kind(sv[1], pre);
         close(sv[0]);
         close(sv[1]);
@@ -180,5 +184,156 @@ int test_member_invoice_preimage_needs_randomness(void) {
     sha256(pre, 32, check);
     TEST_ASSERT(memcmp(check, hash, 32) == 0, "hash of the preimage");
     TEST_ASSERT(memcmp(pre, pre2, 32) != 0, "a new preimage every time");
+    return 1;
+}
+
+
+/* --- The member's own invoice, paid from outside the factory --- */
+
+/* The onion a payer's node builds for us, the last hop: it decodes only
+   with our key, only for its payment hash, and only untouched. */
+int test_member_final_hop_onion(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char sk[32], other[32], sess[32], secret[32], hash[32], hash2[32];
+    memset(sk, 0x31, 32); memset(other, 0x32, 32); memset(sess, 0x41, 32);
+    memset(secret, 0x51, 32); memset(hash, 0x61, 32); memset(hash2, 0x62, 32);
+    secp256k1_pubkey pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk, sk), "key");
+
+    unsigned char tlv[80], onion[1366];
+    size_t n = test_final_hop_tlv(20000000, 520, secret, 20000000, tlv);
+    TEST_ASSERT(test_build_final_onion(ctx, sess, &pk, tlv, n, hash, 32, onion),
+                "build");
+    client_final_hop_t hop;
+    TEST_ASSERT(client_decode_final_hop(ctx, sk, onion, hash, &hop), "decodes");
+    TEST_ASSERT(hop.present && hop.has_payment_data, "payment data");
+    TEST_ASSERT_EQ(hop.amt_to_forward, 20000000, "amount");
+    TEST_ASSERT_EQ(hop.outgoing_cltv, 520, "expiry");
+    TEST_ASSERT_EQ(hop.total_msat, 20000000, "total");
+    TEST_ASSERT(memcmp(hop.payment_secret, secret, 32) == 0, "secret");
+
+    TEST_ASSERT(!client_decode_final_hop(ctx, other, onion, hash, &hop) &&
+                hop.present && !hop.has_payment_data, "not for another key");
+    TEST_ASSERT(!client_decode_final_hop(ctx, sk, onion, hash2, &hop),
+                "not for another payment hash");
+    onion[600] ^= 1;
+    TEST_ASSERT(!client_decode_final_hop(ctx, sk, onion, hash, &hop),
+                "a changed onion is refused");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* BOLT 4 final-hop rules for a payment to our own BOLT 11 invoice: the
+   onion names our payment secret, a single part, at least the invoice
+   amount, and no more than the HTLC carries; without an onion (or with
+   one that is not ours) the preimage stays with us. */
+int test_member_external_payment_rules(void) {
+    unsigned char secret[32], wrong[32];
+    memset(secret, 0x51, 32);
+    memset(wrong, 0x52, 32);
+    const uint64_t inv = 20000000;
+    const uint32_t tip = 400;
+    htlc_t h;
+    memset(&h, 0, sizeof(h));
+    h.direction = HTLC_RECEIVED;
+    h.state = HTLC_STATE_ACTIVE;
+    h.amount_sats = 20000;
+    h.cltv_expiry = 520;
+
+    client_final_hop_t ok;
+    memset(&ok, 0, sizeof(ok));
+    ok.present = 1; ok.has_payment_data = 1;
+    memcpy(ok.payment_secret, secret, 32);
+    ok.amt_to_forward = 20000000; ok.total_msat = 20000000; ok.outgoing_cltv = 520;
+    TEST_ASSERT(client_htlc_pays_invoice(&h, inv, secret, &ok, tip),
+                "a valid outside payment pays");
+
+    client_final_hop_t c = ok;
+    memcpy(c.payment_secret, wrong, 32);
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip), "wrong secret");
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, NULL, tip), "no onion");
+    c = ok; c.has_payment_data = 0;
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip),
+                "an onion that is not ours");
+    c = ok; c.total_msat = 40000000;
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip),
+                "a part of a multi-part payment");
+    c = ok; c.amt_to_forward = c.total_msat = 19000000;
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip),
+                "less than the invoice");
+    c = ok; c.amt_to_forward = c.total_msat = 21000000;
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip),
+                "the onion asks for more than the HTLC carries");
+    c = ok; c.outgoing_cltv = 521;
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, secret, &c, tip),
+                "the HTLC expires sooner than the onion says");
+
+    /* an invoice for a payment inside the factory takes no onion */
+    TEST_ASSERT(client_htlc_pays_invoice(&h, inv, NULL, NULL, tip), "internal");
+    TEST_ASSERT(!client_htlc_pays_invoice(&h, inv, NULL, &ok, tip),
+                "internal invoice with an outside onion");
+    return 1;
+}
+
+/* The member signs its invoice itself, through the LSP's node: the invoice
+   names the member as payee, carries the route hint, and what the member
+   sends the LSP holds the hash but not the preimage or the secret. */
+int test_member_signs_its_own_invoice(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char sk[32];
+    memset(sk, 0x31, 32);
+    secp256k1_pubkey pk;
+    unsigned char pk33[33];
+    size_t len = 33;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk, sk) &&
+                secp256k1_ec_pubkey_serialize(ctx, pk33, &len, &pk,
+                                              SECP256K1_EC_COMPRESSED), "key");
+    unsigned char lsp_node[33];
+    lsp_node[0] = 0x03;
+    memset(lsp_node + 1, 0x44, 32);
+    uint64_t scid = (700ULL << 40) | (1ULL << 16) | 2;
+
+    bolt11_invoice_table_t *tbl = calloc(1, sizeof(*tbl));
+    TEST_ASSERT(tbl != NULL, "alloc");
+    invoice_init(tbl);
+    char b11[2048];
+    TEST_ASSERT(invoice_create_with_hint(tbl, ctx, sk, "regtest", 20000000,
+                    "member", 0, lsp_node, scid, 0, 0, 40, b11, sizeof(b11)),
+                "member signs");
+    const bolt11_invoice_entry_t *e = NULL;
+    for (int i = 0; i < INVOICE_TABLE_MAX; i++)
+        if (tbl->entries[i].active) e = &tbl->entries[i];
+    TEST_ASSERT(e != NULL, "entry");
+
+    bolt11_invoice_t d;
+    TEST_ASSERT(bolt11_decode(ctx, b11, &d), "decodes");
+    TEST_ASSERT(memcmp(d.payee_pubkey, pk33, 33) == 0, "the member is the payee");
+    TEST_ASSERT(memcmp(d.payment_hash, e->payment_hash, 32) == 0, "hash");
+    TEST_ASSERT(d.has_payment_secret &&
+                memcmp(d.payment_secret, e->payment_secret, 32) == 0, "secret");
+    TEST_ASSERT(d.n_hints == 1 && d.hints[0].n_hops == 1 &&
+                memcmp(d.hints[0].hops[0].pubkey, lsp_node, 33) == 0 &&
+                d.hints[0].hops[0].short_channel_id == scid,
+                "routed through the LSP's node");
+
+    /* What the LSP is sent */
+    char pre_hex[65], sec_hex[65];
+    for (int i = 0; i < 32; i++) {
+        sprintf(pre_hex + 2 * i, "%02x", e->preimage[i]);
+        sprintf(sec_hex + 2 * i, "%02x", e->payment_secret[i]);
+    }
+    cJSON *created = wire_build_invoice_created(e->payment_hash, 20000000);
+    wire_invoice_created_set_bolt11(created, b11);
+    cJSON *reg = wire_build_register_invoice(e->payment_hash, 20000000, 0);
+    char *a = cJSON_PrintUnformatted(created), *b = cJSON_PrintUnformatted(reg);
+    TEST_ASSERT(a && b && !strstr(a, pre_hex) && !strstr(b, pre_hex) &&
+                !strstr(b, sec_hex), "no preimage (or secret) goes to the LSP");
+    free(a); free(b);
+    cJSON_Delete(created);
+    cJSON_Delete(reg);
+    free(tbl);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

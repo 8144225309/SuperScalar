@@ -31,6 +31,9 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
+#include "superscalar/invoice.h"
+#include "test_onion_util.h"
+#include <secp256k1_extrakeys.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -172,17 +175,17 @@ int test_bridge_msg_round_trip(void) {
 
     /* BRIDGE_REGISTER */
     {
-        cJSON *j = wire_build_bridge_register(hash, preimage, 50000, 2);
+        cJSON *j = wire_build_bridge_register(hash, 50000, 2);
         TEST_ASSERT(j != NULL, "build bridge_register");
 
         unsigned char ph[32];
-        unsigned char pi2[32];
         uint64_t am;
         size_t dc;
-        TEST_ASSERT(wire_parse_bridge_register(j, ph, pi2, &am, &dc),
+        TEST_ASSERT(wire_parse_bridge_register(j, ph, &am, &dc),
                      "parse bridge_register");
         TEST_ASSERT_MEM_EQ(ph, hash, 32, "register payment_hash");
-        TEST_ASSERT_MEM_EQ(pi2, preimage, 32, "register preimage");
+        TEST_ASSERT(cJSON_GetObjectItem(j, "preimage") == NULL,
+                    "register carries no preimage");
         TEST_ASSERT_EQ(am, 50000, "register amount_msat");
         TEST_ASSERT_EQ(dc, 2, "register dest_client");
         cJSON_Delete(j);
@@ -242,9 +245,9 @@ int test_bridge_invoice_registry(void) {
     memset(pre2, 0xA2, 32);
 
     /* Register invoices */
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash1, pre1, 0, 10000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash1, 0, 10000),
                  "register invoice 1");
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, pre2, 2, 20000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, 2, 20000),
                  "register invoice 2");
     TEST_ASSERT_EQ(mgr.n_invoices, 2, "n_invoices");
 
@@ -459,7 +462,7 @@ int test_bridge_register_forward(void) {
     unsigned char pre[32];
     memset(hash, 0x55, 32);
     memset(pre, 0x66, 32);
-    cJSON *reg = wire_build_bridge_register(hash, pre, 75000, 3);
+    cJSON *reg = wire_build_bridge_register(hash, 75000, 3);
     TEST_ASSERT(reg != NULL, "build register");
 
     wire_msg_t msg;
@@ -499,11 +502,8 @@ int test_bridge_register_forward(void) {
                  "payment_hash hex");
     TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "payment_hash matches");
 
-    /* Verify preimage hex round-trips */
-    unsigned char parsed_pre[32];
-    TEST_ASSERT(wire_json_get_hex(fwd, "preimage", parsed_pre, 32) == 32,
-                 "preimage hex");
-    TEST_ASSERT_MEM_EQ(parsed_pre, pre, 32, "preimage matches");
+    /* The plugin is told the hash only */
+    TEST_ASSERT(cJSON_GetObjectItem(fwd, "preimage") == NULL, "no preimage");
 
     cJSON_Delete(fwd);
     close(sv[0]);
@@ -531,7 +531,7 @@ int test_lsp_inbound_via_bridge(void) {
     sha256(preimage, 32, payment_hash);
 
     /* Register invoice: this payment_hash goes to client 1 */
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, preimage, 1, 100000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, 1, 100000),
                  "register invoice");
 
     /* Verify lookup works */
@@ -1321,7 +1321,7 @@ int test_regtest_bridge_payment(void) {
             ch_mgr.bridge_fd = sv[0];
 
             /* Register invoice: payment_hash → client 0 */
-            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage, 0, 5000000);
+            lsp_channels_register_invoice(&ch_mgr, payment_hash, 0, 5000000);
 
             /* Write BRIDGE_ADD_HTLC from bridge side (sv[1]) */
             cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000, 600, 1);
@@ -1437,12 +1437,19 @@ int test_regtest_bridge_payment(void) {
     return lsp_ok;
 }
 
-/* ---- Test 19: Bridge invoice registration + BOLT11 return flow (regtest) ---- */
+/* ---- Test 19: a member's own invoice, paid from outside (regtest) ----
+   External payer -> Lightning node (the bridge side) -> LSP -> member.  The
+   member signs the invoice and keeps the preimage and payment secret; the
+   LSP and the bridge see only the hash until the member fulfils. */
 
 typedef struct {
+    int active;
+    regtest_t *rt;
+    int pipe_fd;                    /* the member reports its preimage here */
     unsigned char payment_hash[32];
     unsigned char preimage[32];
-    int bolt11_received;
+    unsigned char payment_secret[32];
+    int bolt11_received;            /* unused, kept for the idle clients */
 } invoice_flow_data_t;
 
 static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -1452,111 +1459,101 @@ static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
                            size_t n_participants,
                            void *user_data) {
     invoice_flow_data_t *data = (invoice_flow_data_t *)user_data;
-    (void)keypair; (void)factory; (void)n_participants;
+    (void)factory; (void)n_participants;
+    if (!data->active || my_index != 1)
+        return 1;   /* only client 0 (index 1) receives; the others idle */
 
-    if (my_index != 1) {
-        /* Only client 0 (index 1) is the invoicing party. Others idle. */
-        return 1;
-    }
-
-    /* Step 1: Send MSG_REGISTER_INVOICE to LSP */
-    printf("Invoice flow client %u: sending REGISTER_INVOICE\n", my_index);
-    cJSON *reg = wire_build_register_invoice(data->payment_hash,
-                                              data->preimage,
-                                              5000000, 0);  /* 5000 sat, dest=client 0 */
-    if (!wire_send(fd, MSG_REGISTER_INVOICE, reg)) {
-        fprintf(stderr, "Invoice flow client %u: send REGISTER_INVOICE failed\n", my_index);
-        cJSON_Delete(reg);
+    /* Step 1: the LSP asks for an invoice payable through its node */
+    wire_msg_t msg;
+    if (!recv_skip_revocations_bridge(fd, &msg) ||
+        msg.msg_type != MSG_CREATE_INVOICE) {
+        fprintf(stderr, "Member: expected CREATE_INVOICE\n");
+        if (msg.json) cJSON_Delete(msg.json);
         return 0;
     }
+    uint64_t amt = 0;
+    wire_route_hint_t hint;
+    int ok = wire_parse_create_invoice(msg.json, &amt) &&
+             wire_create_invoice_get_hint(msg.json, &hint) == 1;
+    cJSON_Delete(msg.json);
+    if (!ok) return 0;
+
+    /* Step 2: sign it with our own key; keep preimage and secret */
+    unsigned char sk[32];
+    char b11[2048];
+    bolt11_invoice_table_t *tbl = calloc(1, sizeof(*tbl));
+    if (!tbl || !secp256k1_keypair_sec(ctx, sk, keypair)) return 0;
+    invoice_init(tbl);
+    ok = invoice_create_with_hint(tbl, ctx, sk, "regtest", amt, "member", 0,
+                                  hint.node_id, hint.scid, hint.fee_base_msat,
+                                  hint.fee_ppm, hint.cltv_delta, b11, sizeof(b11));
+    for (int e = 0; ok && e < INVOICE_TABLE_MAX; e++) {
+        if (!tbl->entries[e].active) continue;
+        memcpy(data->preimage, tbl->entries[e].preimage, 32);
+        memcpy(data->payment_hash, tbl->entries[e].payment_hash, 32);
+        memcpy(data->payment_secret, tbl->entries[e].payment_secret, 32);
+    }
+    free(tbl);
+    if (!ok) return 0;
+    cJSON *created = wire_build_invoice_created(data->payment_hash, amt);
+    wire_invoice_created_set_bolt11(created, b11);
+    wire_send(fd, MSG_INVOICE_CREATED, created);
+    cJSON_Delete(created);
+    cJSON *reg = wire_build_register_invoice(data->payment_hash, amt, 0);
+    wire_send(fd, MSG_REGISTER_INVOICE, reg);
     cJSON_Delete(reg);
 
-    /* Step 2: Wait for MSG_INVOICE_BOLT11 from LSP */
-    wire_msg_t msg;
-    if (!recv_skip_revocations_bridge(fd, &msg)) {
-        fprintf(stderr, "Invoice flow client %u: recv BOLT11 failed\n", my_index);
+    /* Step 3: the payment arrives with the payer's onion for us */
+    if (!recv_skip_revocations_bridge(fd, &msg) ||
+        msg.msg_type != MSG_UPDATE_ADD_HTLC) {
+        fprintf(stderr, "Member: expected ADD_HTLC\n");
+        if (msg.json) cJSON_Delete(msg.json);
         return 0;
     }
-    if (msg.msg_type != MSG_INVOICE_BOLT11) {
-        fprintf(stderr, "Invoice flow client %u: expected INVOICE_BOLT11 (0x%02x), got 0x%02x\n",
-                my_index, MSG_INVOICE_BOLT11, msg.msg_type);
-        cJSON_Delete(msg.json);
-        return 0;
-    }
+    client_final_hop_t hop;
+    memset(&hop, 0, sizeof(hop));
+    unsigned char onion[ONION_WIRE_SIZE];
+    if (wire_get_onion(msg.json, onion) == 1)
+        client_decode_final_hop(ctx, sk, onion, data->payment_hash, &hop);
+    secure_zero(sk, sizeof(sk));
+    ok = client_handle_add_htlc(ch, &msg);
+    cJSON_Delete(msg.json);
+    if (!ok) return 0;
+    uint64_t htlc_id = ch->htlcs[ch->n_htlcs - 1].id;
 
-    /* Verify payment_hash matches */
-    unsigned char recv_hash[32];
-    char recv_bolt11[2048];
-    if (!wire_parse_invoice_bolt11(msg.json, recv_hash, recv_bolt11, sizeof(recv_bolt11))) {
-        fprintf(stderr, "Invoice flow client %u: parse BOLT11 failed\n", my_index);
-        cJSON_Delete(msg.json);
-        return 0;
-    }
-    if (memcmp(recv_hash, data->payment_hash, 32) != 0) {
-        fprintf(stderr, "Invoice flow client %u: BOLT11 payment_hash mismatch\n", my_index);
-        cJSON_Delete(msg.json);
-        return 0;
-    }
-    printf("Invoice flow client %u: received BOLT11 = %s\n", my_index, recv_bolt11);
-    data->bolt11_received = 1;
+    if (!recv_skip_revocations_bridge(fd, &msg)) return 0;
+    if (msg.msg_type == MSG_COMMITMENT_SIGNED)
+        client_handle_commitment_signed(fd, ch, ctx, &msg);
     cJSON_Delete(msg.json);
 
-    /* Step 3: Wait for ADD_HTLC (inbound payment from bridge) */
-    if (!recv_skip_revocations_bridge(fd, &msg)) {
-        fprintf(stderr, "Invoice flow client %u: recv ADD_HTLC failed\n", my_index);
-        return 0;
-    }
-    if (msg.msg_type != MSG_UPDATE_ADD_HTLC) {
-        fprintf(stderr, "Invoice flow client %u: expected ADD_HTLC, got 0x%02x\n",
-                my_index, msg.msg_type);
+    /* Step 4: release the preimage only if the onion says it pays us */
+    int tip = regtest_get_block_height(data->rt);
+    int r = client_settle_invoice_htlc(fd, ch, htlc_id, data->preimage, amt,
+                                       data->payment_secret, &hop,
+                                       tip > 0 ? (uint32_t)tip : 0);
+    printf("Member: settle -> %d\n", r);
+    if (r == 1) {
+        if (!recv_skip_revocations_bridge(fd, &msg)) return 0;
+        if (msg.msg_type == MSG_COMMITMENT_SIGNED)
+            client_handle_commitment_signed(fd, ch, ctx, &msg);
         cJSON_Delete(msg.json);
-        return 0;
     }
-    uint64_t htlc_id, amount_msat;
-    unsigned char ph[32];
-    uint32_t cltv;
-    if (wire_parse_update_add_htlc(msg.json, &htlc_id, &amount_msat, ph, &cltv)) {
-        channel_add_htlc(ch, HTLC_RECEIVED, amount_msat / 1000, ph, cltv, &htlc_id);
-    }
-    cJSON_Delete(msg.json);
+    /* Tell the test what the preimage was, after the fact */
+    if (write(data->pipe_fd, data->preimage, 32) != 32) return 0;
+    return r == 1;
+}
 
-    /* Step 4: Handle COMMITMENT_SIGNED */
-    if (!recv_skip_revocations_bridge(fd, &msg)) {
-        fprintf(stderr, "Invoice flow client %u: recv commit failed\n", my_index);
-        return 0;
-    }
-    if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
-        cJSON_Delete(msg.json);
-    } else {
-        cJSON_Delete(msg.json);
-    }
-
-    /* Step 5: Fulfill HTLC with preimage */
-    printf("Invoice flow client %u: fulfilling HTLC\n", my_index);
-    uint64_t fulfill_id = 0;
-    for (size_t i = 0; i < ch->n_htlcs; i++) {
-        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
-            ch->htlcs[i].direction == HTLC_RECEIVED) {
-            fulfill_id = ch->htlcs[i].id;
-            break;
-        }
-    }
-    client_fulfill_payment(fd, ch, fulfill_id, data->preimage);
-
-    /* Step 6: Handle COMMITMENT_SIGNED for the fulfill */
-    if (!recv_skip_revocations_bridge(fd, &msg)) {
-        fprintf(stderr, "Invoice flow client %u: recv commit failed\n", my_index);
-        return 0;
-    }
-    if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-        client_handle_commitment_signed(fd, ch, ctx, &msg);
-        cJSON_Delete(msg.json);
-    } else {
-        cJSON_Delete(msg.json);
-    }
-
-    return 1;
+/* 1 if needle (32 bytes, or its hex) occurs in buf */
+static int contains_secret(const void *buf, size_t len,
+                           const unsigned char *needle) {
+    char hex[65];
+    hex_encode(needle, 32, hex);
+    const unsigned char *b = buf;
+    for (size_t i = 0; i + 32 <= len; i++)
+        if (memcmp(b + i, needle, 32) == 0) return 1;
+    for (size_t i = 0; i + 64 <= len; i++)
+        if (memcmp(b + i, hex, 64) == 0) return 1;
+    return 0;
 }
 
 /* ---- External-node OUT direction: a factory user pays a NON-factory node ----
@@ -2015,18 +2012,16 @@ int test_regtest_bridge_invoice_flow(void) {
     }
     TEST_ASSERT(funding_amount > 0, "funding amount > 0");
 
-    /* Generate payment preimage and hash */
-    unsigned char preimage[32] = { [0 ... 31] = 0x99 };
-    unsigned char payment_hash[32];
-    sha256(preimage, 32, payment_hash);
-
     int lsp_port = 19900 + (getpid() % 1000);
 
-    /* Prepare per-client callback data */
+    /* The member's preimage comes back on this pipe, after the payment */
+    int pre_pipe[2];
+    TEST_ASSERT(pipe(pre_pipe) == 0, "pipe");
     invoice_flow_data_t inv_data;
-    memcpy(inv_data.payment_hash, payment_hash, 32);
-    memcpy(inv_data.preimage, preimage, 32);
-    inv_data.bolt11_received = 0;
+    memset(&inv_data, 0, sizeof(inv_data));
+    inv_data.active = 1;
+    inv_data.rt = &rt;
+    inv_data.pipe_fd = pre_pipe[1];
 
     invoice_flow_data_t idle_data;
     memset(&idle_data, 0, sizeof(idle_data));
@@ -2107,64 +2102,81 @@ int test_regtest_bridge_invoice_flow(void) {
             lsp_ok = 0;
         } else {
             ch_mgr.bridge_fd = sv[0];
+            /* Our Lightning node is the last hop before the member */
+            size_t nlen = 33;
+            secp256k1_ec_pubkey_serialize(ctx, ch_mgr.invoice_hint.node_id,
+                                          &nlen, &pks[0], SECP256K1_EC_COMPRESSED);
+            ch_mgr.invoice_hint.scid = (700ULL << 40) | (1ULL << 16) | 1;
+            ch_mgr.invoice_hint.cltv_delta = 40;
+            ch_mgr.has_invoice_hint = 1;
 
-            /* Step 1: Run event loop for 1 msg — client sends MSG_REGISTER_INVOICE,
-               LSP handles it and writes MSG_BRIDGE_REGISTER to bridge_fd */
-            if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
-                fprintf(stderr, "LSP: event loop (register) failed\n");
+            /* Step 1: the member makes the invoice; the LSP gets the hash */
+            char b11[2048];
+            if (!lsp_channels_create_external_invoice(&ch_mgr, lsp, 0, 5000000,
+                                                      b11, sizeof(b11))) {
+                fprintf(stderr, "LSP: member invoice failed\n");
                 lsp_ok = 0;
             }
 
+            char *reg_json = NULL;
+            bolt11_invoice_t inv;
             if (lsp_ok) {
-                /* Step 2: Read MSG_BRIDGE_REGISTER from bridge side (sv[1]) */
+                /* Step 2: the bridge is told the hash */
                 wire_msg_t reg_msg;
-                if (!wire_recv(sv[1], &reg_msg)) {
-                    fprintf(stderr, "Bridge: recv BRIDGE_REGISTER failed\n");
-                    lsp_ok = 0;
-                } else {
-                    TEST_ASSERT_EQ(reg_msg.msg_type, MSG_BRIDGE_REGISTER,
-                                   "register msg type");
+                TEST_ASSERT(wire_recv(sv[1], &reg_msg) &&
+                            reg_msg.msg_type == MSG_BRIDGE_REGISTER,
+                            "BRIDGE_REGISTER");
+                reg_json = cJSON_PrintUnformatted(reg_msg.json);
+                unsigned char reg_ph[32];
+                uint64_t reg_amount;
+                size_t reg_dest;
+                TEST_ASSERT(wire_parse_bridge_register(reg_msg.json, reg_ph,
+                                                       &reg_amount, &reg_dest) &&
+                            reg_amount == 5000000 && reg_dest == 0,
+                            "parse bridge register");
+                cJSON_Delete(reg_msg.json);
 
-                    unsigned char reg_ph[32], reg_pi[32];
-                    uint64_t reg_amount;
-                    size_t reg_dest;
-                    TEST_ASSERT(wire_parse_bridge_register(reg_msg.json,
-                                    reg_ph, reg_pi, &reg_amount, &reg_dest),
-                                "parse bridge register");
-                    TEST_ASSERT_MEM_EQ(reg_ph, payment_hash, 32,
-                                       "register payment_hash matches");
-                    TEST_ASSERT_MEM_EQ(reg_pi, preimage, 32,
-                                       "register preimage present");
-                    TEST_ASSERT_EQ(reg_amount, 5000000, "register amount_msat");
-                    TEST_ASSERT_EQ(reg_dest, 0, "register dest_client");
-                    printf("Bridge: BRIDGE_REGISTER verified (hash + preimage)\n");
-                    cJSON_Delete(reg_msg.json);
-                }
+                /* Step 3: the outside payer reads the member's invoice */
+                TEST_ASSERT(bolt11_decode(ctx, b11, &inv), "decode invoice");
+                unsigned char m33[33];
+                size_t mlen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, m33, &mlen, &pks[1],
+                                              SECP256K1_EC_COMPRESSED);
+                TEST_ASSERT(memcmp(inv.payee_pubkey, m33, 33) == 0,
+                            "the member is the payee, not the Lightning node");
+                TEST_ASSERT(memcmp(inv.payment_hash, reg_ph, 32) == 0,
+                            "registered hash is the invoice's");
+                TEST_ASSERT(inv.n_hints == 1 &&
+                            memcmp(inv.hints[0].hops[0].pubkey,
+                                   ch_mgr.invoice_hint.node_id, 33) == 0,
+                            "routed through our node");
             }
 
-            if (lsp_ok) {
-                /* Step 3: Send MSG_INVOICE_BOLT11 through bridge side (sv[1]) */
-                const char *test_bolt11 = "lnbcrt50u1ptest_invoice_flow_bolt11";
-                cJSON *bolt11_msg = wire_build_invoice_bolt11(payment_hash, test_bolt11);
-                wire_send(sv[1], MSG_INVOICE_BOLT11, bolt11_msg);
-                cJSON_Delete(bolt11_msg);
-
-                /* Step 4: Run event loop for 1 msg — LSP receives INVOICE_BOLT11
-                   from bridge_fd, forwards to client */
-                if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
-                    fprintf(stderr, "LSP: event loop (bolt11) failed\n");
-                    lsp_ok = 0;
-                }
-            }
+            /* What the LSP holds before the payment */
+            size_t snap_inv_len = ch_mgr.n_invoices * sizeof(invoice_entry_t);
+            size_t snap_org_len = ch_mgr.n_htlc_origins * sizeof(htlc_origin_t);
+            unsigned char *snap_inv = malloc(snap_inv_len + 1);
+            unsigned char *snap_org = malloc(snap_org_len + 1);
+            if (snap_inv) memcpy(snap_inv, ch_mgr.invoices, snap_inv_len);
+            if (snap_org) memcpy(snap_org, ch_mgr.htlc_origins, snap_org_len);
 
             if (lsp_ok) {
-                /* Step 5: Send MSG_BRIDGE_ADD_HTLC through bridge side (sv[1]) */
-                cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000, 600, 1);
+                /* Step 4: the payment arrives at our node, with the
+                   payer's onion for the member */
+                int tip = regtest_get_block_height(&rt);
+                uint32_t cltv = (uint32_t)tip + 200;
+                unsigned char tlv[80], onion[ONION_WIRE_SIZE], sess[32];
+                memset(sess, 0x5c, 32);
+                size_t tl = test_final_hop_tlv(5000000, cltv, inv.payment_secret,
+                                               5000000, tlv);
+                TEST_ASSERT(test_build_final_onion(ctx, sess, &pks[1], tlv, tl,
+                                                   inv.payment_hash, 32, onion),
+                            "payer's onion");
+                cJSON *add = wire_build_bridge_add_htlc(inv.payment_hash, 5000000,
+                                                        cltv, 1);
+                wire_set_onion(add, onion);
                 wire_send(sv[1], MSG_BRIDGE_ADD_HTLC, add);
                 cJSON_Delete(add);
-
-                /* Step 6: Run event loop for 2 msgs — LSP forwards to client,
-                   client fulfills, LSP writes BRIDGE_FULFILL_HTLC */
                 if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 2)) {
                     fprintf(stderr, "LSP: event loop (htlc) failed\n");
                     lsp_ok = 0;
@@ -2172,46 +2184,50 @@ int test_regtest_bridge_invoice_flow(void) {
             }
 
             if (lsp_ok) {
-                /* Step 7: Read MSG_BRIDGE_FULFILL_HTLC from bridge side (sv[1]) */
+                /* Step 5: the member's preimage comes back as the fulfil */
                 wire_msg_t fulfill_msg;
-                if (!wire_recv(sv[1], &fulfill_msg)) {
-                    fprintf(stderr, "Bridge: recv fulfill failed\n");
-                    lsp_ok = 0;
-                } else {
-                    TEST_ASSERT_EQ(fulfill_msg.msg_type, MSG_BRIDGE_FULFILL_HTLC,
-                                   "fulfill msg type");
+                TEST_ASSERT(wire_recv(sv[1], &fulfill_msg) &&
+                            fulfill_msg.msg_type == MSG_BRIDGE_FULFILL_HTLC,
+                            "fulfill");
+                unsigned char recv_ph[32], recv_pi[32];
+                uint64_t recv_hid;
+                TEST_ASSERT(wire_parse_bridge_fulfill_htlc(fulfill_msg.json,
+                                recv_ph, recv_pi, &recv_hid), "parse fulfill");
+                cJSON_Delete(fulfill_msg.json);
+                unsigned char check_hash[32];
+                sha256(recv_pi, 32, check_hash);
+                TEST_ASSERT_MEM_EQ(check_hash, inv.payment_hash, 32,
+                                   "preimage->hash valid");
 
-                    unsigned char recv_ph[32], recv_pi[32];
-                    uint64_t recv_hid;
-                    TEST_ASSERT(wire_parse_bridge_fulfill_htlc(fulfill_msg.json,
-                                    recv_ph, recv_pi, &recv_hid),
-                                "parse bridge fulfill");
+                unsigned char member_pre[32];
+                TEST_ASSERT(read(pre_pipe[0], member_pre, 32) == 32 &&
+                            memcmp(member_pre, recv_pi, 32) == 0,
+                            "the member's own preimage");
+                /* Neither the LSP nor the bridge had it before the fulfil */
+                TEST_ASSERT(reg_json && !contains_secret(reg_json,
+                                strlen(reg_json), recv_pi),
+                            "not in what the bridge was told");
+                TEST_ASSERT(snap_inv && !contains_secret(snap_inv, snap_inv_len,
+                                                         recv_pi),
+                            "not in the LSP's invoice registry");
+                TEST_ASSERT(snap_org && !contains_secret(snap_org, snap_org_len,
+                                                         recv_pi),
+                            "not in the LSP's HTLC origins");
 
-                    /* Verify preimage matches payment hash */
-                    unsigned char check_hash[32];
-                    sha256(recv_pi, 32, check_hash);
-                    TEST_ASSERT_MEM_EQ(check_hash, payment_hash, 32,
-                                       "preimage→hash valid");
-                    TEST_ASSERT_EQ(recv_hid, 1, "bridge htlc_id");
-
-                    /* Verify channel balance: client 0's remote increased */
-                    channel_t *ch0 = &ch_mgr.entries[0].channel;
-                    uint64_t commit_fee =
-                        fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
-                    uint64_t usable = ch0->funding_amount > commit_fee ?
-                                      ch0->funding_amount - commit_fee : 0;
-                    /* The opening split of lsp_channels_init (and the client's
-                       channel): LSP local = usable * pct / 100 at the default
-                       50, the client the rest (the odd sat). */
-                    uint64_t orig_remote = usable - (usable * 50) / 100;
-                    TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
-                                   "payee remote balance increased");
-
-                    printf("Invoice flow: preimage matches, balance correct\n");
-                    cJSON_Delete(fulfill_msg.json);
-                }
+                channel_t *ch0 = &ch_mgr.entries[0].channel;
+                uint64_t commit_fee =
+                    fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
+                uint64_t usable = ch0->funding_amount > commit_fee ?
+                                  ch0->funding_amount - commit_fee : 0;
+                uint64_t orig_remote = usable - (usable * 50) / 100;
+                TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
+                               "payee remote balance increased");
+                printf("Invoice flow: the member settled with its own "
+                       "preimage\n");
             }
-
+            free(reg_json);
+            free(snap_inv);
+            free(snap_org);
             close(sv[0]);
             close(sv[1]);
         }
@@ -2489,41 +2505,68 @@ int test_bridge_heartbeat_config(void) {
 /* ---- Test: INVOICE_BOLT11 wire round-trip over socketpair ---- */
 
 int test_bridge_invoice_bolt11_round_trip(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-
-    unsigned char hash[32];
+    /* Member invoice messages: the LSP and the bridge get the hash only.
+       Anything that offers a preimage is refused; the onion for the member
+       and the member's own BOLT 11 travel as they are. */
+    unsigned char hash[32], pre[32];
     memset(hash, 0xDD, 32);
-    const char *bolt11 = "lnbc100n1ptest...fake_bolt11_string_for_testing";
+    memset(pre, 0x77, 32);
 
-    /* Build and send */
-    cJSON *j = wire_build_invoice_bolt11(hash, bolt11);
-    TEST_ASSERT(j != NULL, "build invoice_bolt11");
-    TEST_ASSERT(wire_send(sv[0], MSG_INVOICE_BOLT11, j), "send invoice_bolt11");
-    cJSON_Delete(j);
+    cJSON *reg = wire_build_register_invoice(hash, 5000, 2);
+    TEST_ASSERT(cJSON_GetObjectItem(reg, "preimage") == NULL, "no preimage built");
+    unsigned char ph[32]; uint64_t am; size_t dc;
+    TEST_ASSERT(wire_parse_register_invoice(reg, ph, &am, &dc) && am == 5000 &&
+                dc == 2 && memcmp(ph, hash, 32) == 0, "register parses");
+    wire_json_add_hex(reg, "preimage", pre, 32);
+    TEST_ASSERT(!wire_parse_register_invoice(reg, ph, &am, &dc),
+                "a REGISTER_INVOICE offering a preimage is refused");
+    cJSON_Delete(reg);
 
-    /* Receive and parse */
-    wire_msg_t msg;
-    TEST_ASSERT(wire_recv(sv[1], &msg), "recv invoice_bolt11");
-    TEST_ASSERT_EQ(msg.msg_type, MSG_INVOICE_BOLT11, "msg type");
+    cJSON *br = wire_build_bridge_register(hash, 5000, 2);
+    TEST_ASSERT(wire_parse_bridge_register(br, ph, &am, &dc), "bridge register");
+    wire_json_add_hex(br, "preimage", pre, 32);
+    TEST_ASSERT(!wire_parse_bridge_register(br, ph, &am, &dc),
+                "a BRIDGE_REGISTER offering a preimage is refused");
+    cJSON_Delete(br);
 
-    unsigned char parsed_hash[32];
-    char parsed_bolt11[2048];
-    TEST_ASSERT(wire_parse_invoice_bolt11(msg.json, parsed_hash,
-                    parsed_bolt11, sizeof(parsed_bolt11)),
-                "parse invoice_bolt11");
-    TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "payment_hash matches");
-    TEST_ASSERT(strcmp(parsed_bolt11, bolt11) == 0, "bolt11 matches");
+    unsigned char onion[ONION_WIRE_SIZE], back[ONION_WIRE_SIZE];
+    for (size_t i = 0; i < sizeof(onion); i++) onion[i] = (unsigned char)(i * 7);
+    cJSON *add = wire_build_update_add_htlc(1, 5000000, hash, 500);
+    TEST_ASSERT(wire_get_onion(add, back) == 0, "no onion yet");
+    wire_set_onion(add, onion);
+    TEST_ASSERT(wire_get_onion(add, back) == 1 &&
+                memcmp(back, onion, sizeof(onion)) == 0, "onion round trip");
+    cJSON_ReplaceItemInObject(add, "onion", cJSON_CreateString("00"));
+    TEST_ASSERT(wire_get_onion(add, back) == -1, "malformed onion");
+    cJSON_Delete(add);
 
-    cJSON_Delete(msg.json);
-    close(sv[0]);
-    close(sv[1]);
+    wire_route_hint_t h, h2;
+    memset(&h, 0, sizeof(h));
+    h.node_id[0] = 0x02; memset(h.node_id + 1, 0x33, 32);
+    h.scid = (700ULL << 40) | (1ULL << 16) | 2;
+    h.fee_base_msat = 1000; h.fee_ppm = 10; h.cltv_delta = 40;
+    cJSON *ci = wire_build_create_invoice(5000);
+    TEST_ASSERT(wire_create_invoice_get_hint(ci, &h2) == 0, "no hint");
+    wire_create_invoice_set_hint(ci, &h);
+    TEST_ASSERT(wire_create_invoice_get_hint(ci, &h2) == 1 &&
+                memcmp(&h, &h2, sizeof(h)) == 0, "hint round trip");
+    cJSON_Delete(ci);
+
+    cJSON *cr = wire_build_invoice_created(hash, 5000);
+    char b11[64];
+    TEST_ASSERT(!wire_invoice_created_get_bolt11(cr, b11, sizeof(b11)), "no bolt11");
+    wire_invoice_created_set_bolt11(cr, "lnbcrt50u1pmember");
+    TEST_ASSERT(wire_invoice_created_get_bolt11(cr, b11, sizeof(b11)) &&
+                strcmp(b11, "lnbcrt50u1pmember") == 0, "bolt11 round trip");
+    cJSON_Delete(cr);
     return 1;
 }
 
 /* ---- Test: bridge_handle_plugin_msg dispatches invoice_bolt11 ---- */
 
 int test_bridge_bolt11_plugin_to_lsp(void) {
+    /* A forward to a member: the plugin hands the bridge the member's onion
+       (CLN's next_onion) and the bridge passes it to the LSP unchanged. */
     int lsp_sv[2];  /* lsp_sv[0]=bridge lsp_fd, lsp_sv[1]=LSP side */
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
 
@@ -2531,34 +2574,31 @@ int test_bridge_bolt11_plugin_to_lsp(void) {
     bridge_init(&br);
     br.lsp_fd = lsp_sv[0];
 
-    /* Simulate plugin sending invoice_bolt11 JSON */
-    unsigned char hash[32];
+    unsigned char hash[32], onion[ONION_WIRE_SIZE];
     memset(hash, 0xEE, 32);
-    char hash_hex[65];
+    for (size_t i = 0; i < sizeof(onion); i++) onion[i] = (unsigned char)(i * 3);
+    char hash_hex[65], onion_hex[2 * ONION_WIRE_SIZE + 1];
     hex_encode(hash, 32, hash_hex);
+    hex_encode(onion, sizeof(onion), onion_hex);
 
-    char line[4096];
-    snprintf(line, sizeof(line),
-        "{\"method\":\"invoice_bolt11\","
-        "\"payment_hash\":\"%s\","
-        "\"bolt11\":\"lnbc500n1ptest_bolt11\"}",
-        hash_hex);
+    char *line = malloc(8192);
+    TEST_ASSERT(line != NULL, "alloc");
+    snprintf(line, 8192,
+        "{\"method\":\"htlc_accepted\",\"payment_hash\":\"%s\","
+        "\"amount_msat\":5000000,\"cltv_expiry\":500,"
+        "\"upstream_id\":\"100x1x0:5\",\"onion\":\"%s\"}",
+        hash_hex, onion_hex);
+    TEST_ASSERT(bridge_handle_plugin_msg(&br, line), "handle htlc_accepted");
+    free(line);
 
-    TEST_ASSERT(bridge_handle_plugin_msg(&br, line), "handle invoice_bolt11");
-
-    /* Read MSG_INVOICE_BOLT11 from LSP side */
     wire_msg_t msg;
     TEST_ASSERT(wire_recv(lsp_sv[1], &msg), "recv from LSP side");
-    TEST_ASSERT_EQ(msg.msg_type, MSG_INVOICE_BOLT11, "msg type");
-
-    unsigned char recv_hash[32];
-    char recv_bolt11[2048];
-    TEST_ASSERT(wire_parse_invoice_bolt11(msg.json, recv_hash,
-                    recv_bolt11, sizeof(recv_bolt11)),
-                "parse bolt11");
-    TEST_ASSERT_MEM_EQ(recv_hash, hash, 32, "hash matches");
-    TEST_ASSERT(strcmp(recv_bolt11, "lnbc500n1ptest_bolt11") == 0,
-                "bolt11 matches");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_BRIDGE_ADD_HTLC, "msg type");
+    unsigned char got[ONION_WIRE_SIZE];
+    TEST_ASSERT(wire_get_onion(msg.json, got) == 1 &&
+                memcmp(got, onion, sizeof(onion)) == 0,
+                "the member's onion reaches the LSP unchanged");
+    TEST_ASSERT(cJSON_GetObjectItem(msg.json, "preimage") == NULL, "no preimage");
 
     cJSON_Delete(msg.json);
     close(lsp_sv[0]);
@@ -2569,6 +2609,8 @@ int test_bridge_bolt11_plugin_to_lsp(void) {
 /* ---- Test: bridge_handle_lsp_msg passes preimage in BRIDGE_REGISTER ---- */
 
 int test_bridge_preimage_passthrough(void) {
+    /* BRIDGE_REGISTER tells the plugin the hash of a member invoice; no
+       preimage goes to the plugin (or CLN). */
     int plugin_sv[2];  /* plugin_sv[0]=plugin side, plugin_sv[1]=bridge plugin_fd */
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, plugin_sv) == 0, "socketpair");
 
@@ -2576,39 +2618,36 @@ int test_bridge_preimage_passthrough(void) {
     bridge_init(&br);
     br.plugin_fd = plugin_sv[1];
 
-    /* Build BRIDGE_REGISTER with preimage */
-    unsigned char hash[32], pre[32];
+    unsigned char hash[32];
     memset(hash, 0x77, 32);
-    memset(pre, 0x88, 32);
-
-    cJSON *reg = wire_build_bridge_register(hash, pre, 42000, 1);
+    cJSON *reg = wire_build_bridge_register(hash, 42000, 1);
     wire_msg_t msg;
     msg.msg_type = MSG_BRIDGE_REGISTER;
     msg.json = reg;
-
     TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "handle register");
     cJSON_Delete(reg);
 
-    /* Read JSON from plugin side */
     char buf[4096];
     ssize_t n = read(plugin_sv[0], buf, sizeof(buf) - 1);
     TEST_ASSERT(n > 0, "read plugin output");
     buf[n] = '\0';
-
     cJSON *fwd = cJSON_Parse(buf);
     TEST_ASSERT(fwd != NULL, "parse forwarded JSON");
-
-    /* Verify preimage is present */
-    unsigned char parsed_pre[32];
-    TEST_ASSERT(wire_json_get_hex(fwd, "preimage", parsed_pre, 32) == 32,
-                 "preimage in JSON");
-    TEST_ASSERT_MEM_EQ(parsed_pre, pre, 32, "preimage matches");
-
-    /* Verify payment_hash */
+    TEST_ASSERT(cJSON_GetObjectItem(fwd, "preimage") == NULL,
+                "no preimage goes to the plugin");
     unsigned char parsed_hash[32];
     TEST_ASSERT(wire_json_get_hex(fwd, "payment_hash", parsed_hash, 32) == 32,
                  "payment_hash in JSON");
     TEST_ASSERT_MEM_EQ(parsed_hash, hash, 32, "hash matches");
+
+    /* One that carries a preimage is not passed on */
+    cJSON *bad = wire_build_bridge_register(hash, 42000, 1);
+    unsigned char pre[32];
+    memset(pre, 0x88, 32);
+    wire_json_add_hex(bad, "preimage", pre, 32);
+    msg.json = bad;
+    TEST_ASSERT(!bridge_handle_lsp_msg(&br, &msg), "refused");
+    cJSON_Delete(bad);
 
     cJSON_Delete(fwd);
     close(plugin_sv[0]);
@@ -2619,58 +2658,16 @@ int test_bridge_preimage_passthrough(void) {
 /* ---- Test: keysend wire round-trip + LSP bridge keysend handling ---- */
 
 int test_bridge_keysend_inbound(void) {
-    /* 1. Build keysend ADD_HTLC with preimage + dest_client */
+    /* A spontaneous payment carries its own preimage for the payee; the LSP
+       would hold it, so it is refused and nothing is registered. */
     unsigned char preimage[32], hash[32];
     memset(preimage, 0xCC, 32);
     sha256(preimage, 32, hash);
 
-    cJSON *ks = wire_build_bridge_add_htlc_keysend(hash, 50000, 144, 7,
-                                                      preimage, 2);
-    TEST_ASSERT(ks != NULL, "build keysend");
-
-    /* Verify keysend fields present */
-    cJSON *ks_flag = cJSON_GetObjectItem(ks, "keysend");
-    TEST_ASSERT(ks_flag && cJSON_IsTrue(ks_flag), "keysend flag true");
-    cJSON *dc = cJSON_GetObjectItem(ks, "dest_client");
-    TEST_ASSERT(dc && cJSON_IsNumber(dc) && (int)dc->valuedouble == 2,
-                "dest_client == 2");
-
-    /* 2. Parse with keysend-aware parser */
-    unsigned char p_hash[32], p_pre[32];
-    uint64_t p_amt, p_htlc;
-    uint32_t p_cltv;
-    int p_is_ks = 0;
-    size_t p_dest = 99;
-
-    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(ks, p_hash, &p_amt, &p_cltv,
-                    &p_htlc, &p_is_ks, p_pre, &p_dest),
-                "parse keysend");
-    TEST_ASSERT(p_is_ks == 1, "is_keysend = 1");
-    TEST_ASSERT_MEM_EQ(p_hash, hash, 32, "hash matches");
-    TEST_ASSERT_MEM_EQ(p_pre, preimage, 32, "preimage matches");
-    TEST_ASSERT_EQ((long)p_dest, 2, "dest_client matches");
-    TEST_ASSERT_EQ((long)p_amt, 50000, "amount matches");
-    TEST_ASSERT_EQ((long)p_cltv, 144, "cltv matches");
-    TEST_ASSERT_EQ((long)p_htlc, 7, "htlc_id matches");
-
-    /* 3. Parse regular (non-keysend) ADD_HTLC — keysend flag should be 0 */
-    cJSON *reg = wire_build_bridge_add_htlc(hash, 50000, 144, 7);
-    int reg_ks = 1;
-    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(reg, p_hash, &p_amt, &p_cltv,
-                    &p_htlc, &reg_ks, p_pre, &p_dest),
-                "parse regular as keysend");
-    TEST_ASSERT(reg_ks == 0, "non-keysend flag = 0");
-
-    cJSON_Delete(ks);
-    cJSON_Delete(reg);
-
-    /* 4. Test LSP bridge handler with keysend message over socketpair */
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.ctx = ctx;
@@ -2682,54 +2679,36 @@ int test_bridge_keysend_inbound(void) {
     mgr.invoices_cap = MAX_INVOICE_REGISTRY;
     mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
     mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
-    for (size_t i = 0; i < 4; i++) {
-        mgr.entries[i].channel.local_amount = 50000;
-        mgr.entries[i].channel.remote_amount = 50000;
-    }
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
 
-    /* Send keysend ADD_HTLC via bridge */
-    cJSON *ks2 = wire_build_bridge_add_htlc_keysend(hash, 10000000, 200, 42,
-                                                       preimage, 1);
-    wire_send(sv[1], MSG_BRIDGE_ADD_HTLC, ks2);
-    cJSON_Delete(ks2);
+    cJSON *ks = wire_build_bridge_add_htlc(hash, 10000000, 200, 42);
+    cJSON_AddBoolToObject(ks, "keysend", 1);
+    wire_json_add_hex(ks, "preimage", preimage, 32);
+    cJSON_AddNumberToObject(ks, "dest_client", 1);
+    wire_msg_t m;
+    m.msg_type = MSG_BRIDGE_ADD_HTLC;
+    m.json = ks;
+    TEST_ASSERT(lsp_channels_handle_bridge_msg(&mgr, lsp, &m), "handled");
+    cJSON_Delete(ks);
 
-    /* Read and handle in bridge handler — should register invoice for keysend */
-    wire_msg_t recv_msg;
-    TEST_ASSERT(wire_recv(sv[0], &recv_msg), "recv keysend msg");
-    TEST_ASSERT_EQ(recv_msg.msg_type, MSG_BRIDGE_ADD_HTLC, "msg type");
+    wire_msg_t r;
+    unsigned char rh[32];
+    char reason[64];
+    uint64_t rid = 0;
+    TEST_ASSERT(wire_recv_timeout(sv[1], &r, 5), "bridge answered");
+    TEST_ASSERT(r.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+                wire_parse_bridge_fail_htlc(r.json, rh, reason, sizeof(reason), &rid) &&
+                rid == 42 && strcmp(reason, "keysend_unsupported") == 0,
+                "keysend refused");
+    cJSON_Delete(r.json);
+    size_t dest;
+    TEST_ASSERT(!lsp_channels_lookup_invoice(&mgr, hash, &dest),
+                "nothing registered from a keysend");
 
-    /* Verify invoice was NOT registered before handle (it shouldn't be) */
-    size_t lookup_dest;
-    TEST_ASSERT(!lsp_channels_lookup_invoice(&mgr, hash, &lookup_dest),
-                "no invoice before handle");
-
-    /* We can't fully run handle_bridge_msg because it needs valid lsp_t with
-       real client fds, but we can verify the keysend parsing works e2e */
-    int is_ks_check = 0;
-    unsigned char pre_check[32];
-    size_t dest_check = 99;
-    unsigned char hash_check[32];
-    uint64_t amt_check, htlc_check;
-    uint32_t cltv_check;
-    TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(recv_msg.json, hash_check,
-                    &amt_check, &cltv_check, &htlc_check,
-                    &is_ks_check, pre_check, &dest_check),
-                "parse received keysend");
-    TEST_ASSERT(is_ks_check == 1, "received is keysend");
-    TEST_ASSERT_EQ((long)dest_check, 1, "dest_client = 1");
-    TEST_ASSERT_MEM_EQ(pre_check, preimage, 32, "preimage round-trip");
-
-    /* Register invoice via keysend path and verify lookup works */
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash_check, pre_check,
-                    dest_check, amt_check),
-                "keysend register");
-    TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, hash_check, &lookup_dest),
-                "lookup after keysend register");
-    TEST_ASSERT_EQ((long)lookup_dest, 1, "dest_client from lookup");
-
-    cJSON_Delete(recv_msg.json);
     close(sv[0]);
     close(sv[1]);
+    free(lsp);
     free(mgr.entries);
     free(mgr.invoices);
     free(mgr.htlc_origins);
@@ -3023,7 +3002,7 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
 
             /* Register invoice routed to the configured payee channel.
                channel index = client index (0-based). */
-            lsp_channels_register_invoice(&ch_mgr, payment_hash, preimage,
+            lsp_channels_register_invoice(&ch_mgr, payment_hash,
                                            payee_client_idx, 5000000);
 
             cJSON *add = wire_build_bridge_add_htlc(payment_hash, 5000000,
@@ -4060,9 +4039,9 @@ int test_bridge_plugin_auth(void) {
 
     /* The secret itself was never needed on the wire, and a message sent
        now is ordinary plugin traffic. */
-    TEST_ASSERT(plugin_send_msg(&br, plugin, "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
-        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
-        "\"bolt11\":\"lnbcrt1ptest\"}"), "send plugin message");
+    TEST_ASSERT(plugin_send_msg(&br, plugin, "{\"method\":\"htlc_resolved\",\"payment_hash\":"
+        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"}"),
+        "send plugin message");
     TEST_ASSERT(wait_readable(br.plugin_fd), "plugin data");
     char *next = bridge_read_plugin_line(&br);
     TEST_ASSERT(next != NULL, "message available");
@@ -4070,7 +4049,7 @@ int test_bridge_plugin_auth(void) {
     free(next);
     wire_msg_t fwd;
     TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &fwd, 5), "forwarded to LSP");
-    TEST_ASSERT_EQ(fwd.msg_type, MSG_INVOICE_BOLT11, "INVOICE_BOLT11");
+    TEST_ASSERT_EQ(fwd.msg_type, MSG_BRIDGE_FULFILL_ACK, "FULFILL_ACK");
     cJSON_Delete(fwd.json);
 
     /* While it is connected nobody else gets in, and the plugin keeps its
@@ -4146,7 +4125,7 @@ int test_lsp_inbound_amount_below_invoice(void) {
     memset(preimage, 0x39, 32);
     sha256(preimage, 32, hash);
     const uint64_t INVOICE_MSAT = 5000000;
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, INVOICE_MSAT),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, 1, INVOICE_MSAT),
                 "register invoice");
     uint64_t registered = 0;
     TEST_ASSERT(lsp_channels_invoice_amount(&mgr, hash, &registered), "invoice found");
@@ -4200,7 +4179,7 @@ int test_lsp_inbound_amount_below_invoice(void) {
     unsigned char preimage2[32], hash2[32];
     memset(preimage2, 0x3a, 32);
     sha256(preimage2, 32, hash2);
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, preimage2, 0, 0),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, 0, 0),
                 "register amountless invoice");
     TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash2, 1000, 10, 95,
                                    reason, sizeof(reason)), "HTLC failed back");
@@ -4666,7 +4645,7 @@ int test_lsp_inbound_replay_reattaches(void) {
     unsigned char preimage[32], hash[32], got[32];
     memset(preimage, 0x44, 32);
     sha256(preimage, 32, hash);
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 5000000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, 1, 5000000),
                 "register invoice");
     char reason[128];
 
@@ -4745,7 +4724,7 @@ int test_lsp_inbound_replay_restored_origin(void) {
     unsigned char preimage[32], hash[32], got[32];
     memset(preimage, 0x45, 32);
     sha256(preimage, 32, hash);
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 5000000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, 1, 5000000),
                 "register invoice");
     char reason[128];
 
@@ -5047,7 +5026,7 @@ int test_lsp_outbound_internal_invoice_refused(void) {
     unsigned char preimage[32], hash[32];
     memset(preimage, 0x53, 32);
     sha256(preimage, 32, hash);
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 4000000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, 1, 4000000),
                 "client 1's invoice");
     char inv[2048], reason[128];
     TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, (uint32_t)time(NULL),
@@ -5107,20 +5086,18 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
     f.client_fd = cl[0]; f.client_peer = cl[1];
     shutdown(f.client_peer, SHUT_WR);   /* the client never answers */
     {
-        cJSON *reg = wire_build_register_invoice(f.hash, f.preimage, 4000000, 0);
+        cJSON *reg = wire_build_register_invoice(f.hash, 4000000, 0);
         wire_msg_t m; m.msg_type = MSG_REGISTER_INVOICE; m.json = reg;
         TEST_ASSERT(lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m), "handled");
         cJSON_Delete(reg);
         TEST_ASSERT(!lsp_channels_lookup_invoice(&f.mgr, f.hash, &dest),
                     "hash in flight is not registered as an invoice");
         wire_msg_t r;
-        TEST_ASSERT(wire_recv_timeout(f.client_peer, &r, 5), "client answered");
-        unsigned char rh[32]; char rb[64];
-        TEST_ASSERT(r.msg_type == MSG_INVOICE_BOLT11 &&
-                    wire_parse_invoice_bolt11(r.json, rh, rb, sizeof(rb)) &&
-                    rb[0] == '\0', "with an empty invoice");
-        cJSON_Delete(r.json);
-        TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, f.preimage, 0, 4000000),
+        memset(&r, 0, sizeof(r));
+        TEST_ASSERT(!wire_recv_timeout(f.client_peer, &r, 1),
+                    "nothing is sent back for it");
+        if (r.json) cJSON_Delete(r.json);
+        TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, 0, 4000000),
                     "direct registration refused too");
     }
 
@@ -5129,8 +5106,9 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
                                    500, 70, reason, sizeof(reason)), "failed back");
     TEST_ASSERT(strcmp(reason, "payment_hash_in_use") == 0, "inbound HTLC refused");
     {
-        cJSON *ks = wire_build_bridge_add_htlc_keysend(f.hash, 4000000, 500, 71,
-                                                         f.preimage, 0);
+        cJSON *ks = wire_build_bridge_add_htlc(f.hash, 4000000, 500, 71);
+        cJSON_AddBoolToObject(ks, "keysend", 1);
+        wire_json_add_hex(ks, "preimage", f.preimage, 32);
         wire_msg_t m; m.msg_type = MSG_BRIDGE_ADD_HTLC; m.json = ks;
         TEST_ASSERT(lsp_channels_handle_bridge_msg(&f.mgr, f.lsp, &m), "handled");
         cJSON_Delete(ks);
@@ -5138,8 +5116,8 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
         TEST_ASSERT(wire_recv_timeout(f.bridge_peer, &r, 5), "bridge answered");
         TEST_ASSERT(r.msg_type == MSG_BRIDGE_FAIL_HTLC &&
                     wire_parse_bridge_fail_htlc(r.json, rh, reason, sizeof(reason), &rid) &&
-                    rid == 71 && strcmp(reason, "payment_hash_in_use") == 0,
-                    "keysend for the hash refused");
+                    rid == 71 && strcmp(reason, "keysend_unsupported") == 0,
+                    "keysend refused");
         cJSON_Delete(r.json);
         TEST_ASSERT(!lsp_channels_lookup_invoice(&f.mgr, f.hash, &dest),
                     "keysend did not register the hash");
@@ -5176,7 +5154,7 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
 
     /* Paid: the hash can still not become an invoice or an inbound payment */
     TEST_ASSERT(lsp_channels_hash_spent_or_busy(&f.mgr, f.hash), "hash is spent");
-    TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, f.preimage, 0, 4000000),
+    TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, 0, 4000000),
                 "paid hash not registered");
     wire_msg_t drain;
     while (wire_recv_timeout(f.bridge_peer, &drain, 1)) cJSON_Delete(drain.json);
@@ -5188,7 +5166,7 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
     unsigned char p2[32], h2[32];
     memset(p2, 0x74, 32);
     sha256(p2, 32, h2);
-    TEST_ASSERT(lsp_channels_register_invoice(&f.mgr, h2, p2, 0, 1000), "fresh hash ok");
+    TEST_ASSERT(lsp_channels_register_invoice(&f.mgr, h2, 0, 1000), "fresh hash ok");
 
     free(f.mgr.invoices);
     f.mgr.persist = NULL;
@@ -5223,7 +5201,7 @@ int test_lsp_inbound_origin_table_and_rollback(void) {
     sha256(preimage, 32, hash);
     memset(other[0], 0x47, 32);
     memset(other[1], 0x48, 32);
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 0, 5000000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, 0, 5000000),
                 "register invoice");
     channel_t *ch = &mgr.entries[0].channel;
     ch->local_amount = 100000;
@@ -5657,9 +5635,8 @@ static int authenticated_plugin(bridge_t *br) {
 
 int test_bridge_plugin_line_auth(void) {
     static const char INVOICE_MSG[] =
-        "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
-        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
-        "\"bolt11\":\"lnbcrt1ptest\"}";
+        "{\"method\":\"htlc_resolved\",\"payment_hash\":"
+        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"}";
     bridge_t br;
     bridge_init(&br);
     int lsp_sv[2];
@@ -5744,7 +5721,7 @@ int test_bridge_plugin_line_auth(void) {
     TEST_ASSERT(plugin >= 0, "plugin authenticated");
     bridge_plugin_line_mac(t_session_key, "p2b", 0, INVOICE_MSG, mac);
     snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
-    *strstr(line, "lnbcrt1ptest") = 'L';
+    *strstr(line, "cdcdcd") = 'C';
     TEST_ASSERT(send_str(plugin, line), "send altered");
     TEST_ASSERT(wait_readable(br.plugin_fd), "data");
     TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "altered line: dropped");
@@ -6644,5 +6621,183 @@ int test_client_handles_update_fail_htlc(void) {
     close(cl[1]); close(br[0]); close(br[1]);
     free(mgr.entries); free(mgr.htlc_origins); free(lsp);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+/* --- A member that is not connected: the LSP holds its payment --- */
+
+typedef struct {
+    secp256k1_context *ctx;
+    lsp_channel_mgr_t mgr;
+    lsp_t *lsp;
+    persist_t db;
+    int fds[2];
+    int sv[2];          /* sv[0] the LSP's bridge fd, sv[1] the bridge */
+    unsigned char hash[32];
+    unsigned char onion[ONION_WIRE_SIZE];
+} held_fixture_t;
+
+static int held_fixture_init(held_fixture_t *f) {
+    memset(f, 0, sizeof(*f));
+    f->ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                      SECP256K1_CONTEXT_VERIFY);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, f->sv) != 0) return 0;
+    if (!persist_open(&f->db, NULL)) return 0;
+    lsp_channel_mgr_t *m = &f->mgr;
+    m->ctx = f->ctx;
+    m->n_channels = 2;
+    m->bridge_fd = f->sv[0];
+    m->persist = &f->db;
+    m->entries = calloc(2, sizeof(lsp_channel_entry_t));
+    m->entries_cap = 2;
+    m->invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    m->invoices_cap = MAX_INVOICE_REGISTRY;
+    m->htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    m->htlc_origins_cap = MAX_HTLC_ORIGINS;
+    f->lsp = calloc(1, sizeof(lsp_t));
+    if (!m->entries || !m->invoices || !m->htlc_origins || !f->lsp) return 0;
+    for (int i = 0; i < 2; i++) {
+        m->entries[i].channel.local_amount = 100000;
+        m->entries[i].channel.remote_amount = 100000;
+        m->entries[i].ready = 1;
+    }
+    f->fds[0] = f->fds[1] = -1;           /* nobody connected */
+    f->lsp->client_fds = f->fds;
+    memset(f->hash, 0x6d, 32);
+    for (size_t i = 0; i < sizeof(f->onion); i++)
+        f->onion[i] = (unsigned char)(i * 11 + 1);
+    return lsp_channels_register_invoice(m, f->hash, 1, 5000000);
+}
+
+static void held_fixture_free(held_fixture_t *f) {
+    for (size_t i = 0; i < f->mgr.n_channels; i++)
+        channel_cleanup(&f->mgr.entries[i].channel);
+    close(f->sv[0]);
+    close(f->sv[1]);
+    persist_close(&f->db);
+    free(f->lsp);
+    free(f->mgr.entries);
+    free(f->mgr.invoices);
+    free(f->mgr.htlc_origins);
+    secp256k1_context_destroy(f->ctx);
+}
+
+static int bridge_offers(held_fixture_t *f, uint32_t cltv, uint64_t id) {
+    cJSON *add = wire_build_bridge_add_htlc(f->hash, 5000000, cltv, id);
+    wire_set_onion(add, f->onion);
+    wire_msg_t m;
+    m.msg_type = MSG_BRIDGE_ADD_HTLC;
+    m.json = add;
+    int ok = lsp_channels_handle_bridge_msg(&f->mgr, f->lsp, &m);
+    cJSON_Delete(add);
+    return ok;
+}
+
+static htlc_origin_t *held_origin(lsp_channel_mgr_t *m) {
+    for (size_t i = 0; i < m->n_htlc_origins; i++)
+        if (m->htlc_origins[i].active && m->htlc_origins[i].held)
+            return &m->htlc_origins[i];
+    return NULL;
+}
+
+/* A payment for a member that is not connected is held, not failed and not
+   settled; it survives an LSP restart; and it is failed back to the
+   Lightning node a safety margin before it expires. */
+int test_bridge_member_offline_htlc_held(void) {
+    held_fixture_t f;
+    TEST_ASSERT(held_fixture_init(&f), "fixture");
+    const uint32_t cltv = 600;
+    TEST_ASSERT(bridge_offers(&f, cltv, 9), "handled");
+
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    TEST_ASSERT(!wire_recv_timeout(f.sv[1], &r, 1),
+                "nothing goes back to the Lightning node: the HTLC is held");
+    htlc_origin_t *o = held_origin(&f.mgr);
+    TEST_ASSERT(o && o->sender_idx == 1 && o->amount_msat == 5000000 &&
+                o->has_onion && memcmp(o->onion, f.onion, sizeof(f.onion)) == 0,
+                "held for client 1 with its onion");
+    TEST_ASSERT_EQ(f.mgr.entries[1].channel.n_htlcs, 0, "nothing in the channel");
+
+    /* An LSP restart finds it again */
+    {
+        lsp_channel_mgr_t m2;
+        memset(&m2, 0, sizeof(m2));
+        m2.persist = &f.db;
+        m2.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+        m2.htlc_origins_cap = MAX_HTLC_ORIGINS;
+        TEST_ASSERT(lsp_channels_restore_origins(&m2) == 1, "restored");
+        htlc_origin_t *o2 = held_origin(&m2);
+        TEST_ASSERT(o2 && o2->amount_msat == 5000000 && o2->has_onion &&
+                    memcmp(o2->onion, f.onion, sizeof(f.onion)) == 0,
+                    "still held after a restart");
+        free(m2.htlc_origins);
+    }
+
+    /* Held up to the margin before its expiry, then failed back */
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp,
+                                            cltv - FACTORY_CLTV_DELTA_DEFAULT - 1);
+    TEST_ASSERT(!wire_recv_timeout(f.sv[1], &r, 1), "still held");
+    TEST_ASSERT(held_origin(&f.mgr) != NULL, "still held");
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp,
+                                            cltv - FACTORY_CLTV_DELTA_DEFAULT);
+    TEST_ASSERT(wire_recv_timeout(f.sv[1], &r, 5), "the node is answered");
+    unsigned char rh[32];
+    char reason[64];
+    uint64_t rid = 0;
+    TEST_ASSERT(r.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+                wire_parse_bridge_fail_htlc(r.json, rh, reason, sizeof(reason), &rid) &&
+                rid == 9 && memcmp(rh, f.hash, 32) == 0,
+                "failed back, never settled");
+    cJSON_Delete(r.json);
+    TEST_ASSERT(held_origin(&f.mgr) == NULL, "no longer held");
+    uint64_t am;
+    int has;
+    unsigned char on[ONION_WIRE_SIZE];
+    TEST_ASSERT(!persist_load_held_inbound(&f.db, f.mgr.htlc_origins[0].db_id,
+                                           &am, on, sizeof(on), &has),
+                "and gone from the database");
+    held_fixture_free(&f);
+    return 1;
+}
+
+/* When the member reconnects, the held HTLC is offered to it with the
+   payer's onion; the LSP still has nothing to settle it with. */
+int test_bridge_held_htlc_offered_on_reconnect(void) {
+    held_fixture_t f;
+    TEST_ASSERT(held_fixture_init(&f), "fixture");
+    TEST_ASSERT(bridge_offers(&f, 600, 11), "handled");
+    TEST_ASSERT(held_origin(&f.mgr) != NULL, "held");
+
+    int cl[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    f.fds[1] = cl[0];                       /* client 1 is back */
+    TEST_ASSERT(lsp_channels_replay_held_inbound(&f.mgr, f.lsp, 1) == 1,
+                "the held HTLC is offered");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(cl[1], &m, 5) &&
+                m.msg_type == MSG_UPDATE_ADD_HTLC, "client gets UPDATE_ADD_HTLC");
+    unsigned char got[ONION_WIRE_SIZE], ph[32];
+    uint64_t hid, amt;
+    uint32_t cltv;
+    TEST_ASSERT(wire_parse_update_add_htlc(m.json, &hid, &amt, ph, &cltv) &&
+                amt == 5000000 && cltv == 600 && memcmp(ph, f.hash, 32) == 0,
+                "for the held payment");
+    TEST_ASSERT(wire_get_onion(m.json, got) == 1 &&
+                memcmp(got, f.onion, sizeof(got)) == 0, "with its onion");
+    cJSON_Delete(m.json);
+    TEST_ASSERT(held_origin(&f.mgr) == NULL, "no longer held");
+
+    /* Whatever the bridge hears now, it is never a fulfil from the LSP */
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    if (wire_recv_timeout(f.sv[1], &r, 1)) {
+        TEST_ASSERT(r.msg_type != MSG_BRIDGE_FULFILL_HTLC, "no fulfil by the LSP");
+        cJSON_Delete(r.json);
+    }
+    close(cl[0]);
+    close(cl[1]);
+    held_fixture_free(&f);
     return 1;
 }

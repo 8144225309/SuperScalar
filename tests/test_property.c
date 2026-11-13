@@ -499,26 +499,25 @@ int test_prop_persist_factory_roundtrip(void) {
 int test_prop_wire_register_roundtrip(void) {
     unsigned int seed = 42;
     for (int trial = 0; trial < 500; trial++) {
-        unsigned char hash[32], pre[32];
-        for (int i = 0; i < 32; i++) {
+        unsigned char hash[32];
+        for (int i = 0; i < 32; i++)
             hash[i] = (unsigned char)(rand_r(&seed) & 0xff);
-            pre[i] = (unsigned char)(rand_r(&seed) & 0xff);
-        }
         uint64_t amount = 1 + ((uint64_t)rand_r(&seed) % 100000000);
         size_t dest = rand_r(&seed) % 16;
 
-        cJSON *json = wire_build_register_invoice(hash, pre, amount, dest);
+        cJSON *json = wire_build_register_invoice(hash, amount, dest);
         TEST_ASSERT(json != NULL, "build returned NULL");
 
-        unsigned char p_hash[32], p_pre[32];
+        unsigned char p_hash[32];
         uint64_t p_amount;
         size_t p_dest;
-        int ok = wire_parse_register_invoice(json, p_hash, p_pre, &p_amount, &p_dest);
+        TEST_ASSERT(cJSON_GetObjectItem(json, "preimage") == NULL,
+                    "no preimage in REGISTER_INVOICE");
+        int ok = wire_parse_register_invoice(json, p_hash, &p_amount, &p_dest);
         cJSON_Delete(json);
 
         TEST_ASSERT(ok, "parse failed");
         TEST_ASSERT_MEM_EQ(hash, p_hash, 32, "hash mismatch");
-        TEST_ASSERT_MEM_EQ(pre, p_pre, 32, "preimage mismatch");
         TEST_ASSERT(p_amount == amount, "amount mismatch");
         TEST_ASSERT(p_dest == dest, "dest mismatch");
     }
@@ -527,101 +526,6 @@ int test_prop_wire_register_roundtrip(void) {
 
 /* ==== Signet/Testnet4 Gap Tests ==== */
 
-/* Test 1: Randomized keysend wire round-trip fuzzing.
-   Generate random payment_hash/preimage/amounts, verify build→parse identity.
-   Covers edge cases: max uint64, zero amounts, all-FF hashes. */
-int test_prop_keysend_wire_roundtrip(void) {
-    unsigned int seed = 42;
-    for (int trial = 0; trial < 500; trial++) {
-        unsigned char hash[32], preimage[32];
-        for (int i = 0; i < 32; i++) {
-            preimage[i] = (unsigned char)(rand_r(&seed) & 0xff);
-        }
-        sha256(preimage, 32, hash);
-
-        uint64_t amount = (trial == 0) ? 1 :         /* min 1 msat */
-                          (trial == 1) ? 0 :          /* zero msat edge */
-                          (trial == 2) ? (uint64_t)4000000000000ULL : /* large */
-                          1 + ((uint64_t)rand_r(&seed) % 100000000);
-        uint32_t cltv = (trial == 3) ? 0 : rand_r(&seed);
-        uint64_t htlc_id = rand_r(&seed) % 4000000000ULL;
-        size_t dest = rand_r(&seed) % 16;
-
-        /* Build keysend variant */
-        cJSON *json = wire_build_bridge_add_htlc_keysend(hash, amount, cltv,
-                                                            htlc_id, preimage, dest);
-        TEST_ASSERT(json != NULL, "build keysend NULL");
-
-        /* Parse with keysend-aware parser */
-        unsigned char p_hash[32], p_pre[32];
-        uint64_t p_amt, p_hid;
-        uint32_t p_cltv;
-        int p_ks = 0;
-        size_t p_dest = 99;
-        int ok = wire_parse_bridge_add_htlc_keysend(json, p_hash, &p_amt,
-                    &p_cltv, &p_hid, &p_ks, p_pre, &p_dest);
-        cJSON_Delete(json);
-
-        TEST_ASSERT(ok, "parse failed");
-        TEST_ASSERT(p_ks == 1, "keysend flag");
-        TEST_ASSERT_MEM_EQ(hash, p_hash, 32, "hash mismatch");
-        TEST_ASSERT_MEM_EQ(preimage, p_pre, 32, "preimage mismatch");
-        TEST_ASSERT(p_amt == amount, "amount mismatch");
-        TEST_ASSERT(p_cltv == cltv, "cltv mismatch");
-        TEST_ASSERT(p_hid == htlc_id, "htlc_id mismatch");
-        TEST_ASSERT(p_dest == dest, "dest mismatch");
-
-        /* Also verify base parser still works (backward compat) */
-        cJSON *json2 = wire_build_bridge_add_htlc_keysend(hash, amount, cltv,
-                                                             htlc_id, preimage, dest);
-        unsigned char b_hash[32];
-        uint64_t b_amt, b_hid;
-        uint32_t b_cltv;
-        ok = wire_parse_bridge_add_htlc(json2, b_hash, &b_amt, &b_cltv, &b_hid);
-        cJSON_Delete(json2);
-        TEST_ASSERT(ok, "base parse of keysend msg failed");
-        TEST_ASSERT_MEM_EQ(hash, b_hash, 32, "base hash mismatch");
-    }
-
-    /* Edge: all-FF hash and preimage */
-    {
-        unsigned char ff_hash[32], ff_pre[32];
-        memset(ff_pre, 0xFF, 32);
-        sha256(ff_pre, 32, ff_hash);
-        cJSON *j = wire_build_bridge_add_htlc_keysend(ff_hash, UINT64_MAX / 2,
-                                                         UINT32_MAX, 0, ff_pre, 0);
-        unsigned char p_h[32], p_p[32];
-        uint64_t a, h;
-        uint32_t c;
-        int ks;
-        size_t d;
-        TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(j, p_h, &a, &c, &h,
-                        &ks, p_p, &d), "FF edge parse");
-        TEST_ASSERT(ks == 1, "FF edge keysend");
-        TEST_ASSERT_MEM_EQ(ff_pre, p_p, 32, "FF preimage");
-        cJSON_Delete(j);
-    }
-
-    /* Edge: all-zero hash */
-    {
-        unsigned char zero_hash[32], zero_pre[32];
-        memset(zero_pre, 0, 32);
-        sha256(zero_pre, 32, zero_hash);
-        cJSON *j = wire_build_bridge_add_htlc_keysend(zero_hash, 1, 1, 1,
-                                                         zero_pre, 0);
-        unsigned char p_h[32], p_p[32];
-        uint64_t a, h;
-        uint32_t c;
-        int ks;
-        size_t d;
-        TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(j, p_h, &a, &c, &h,
-                        &ks, p_p, &d), "zero edge parse");
-        TEST_ASSERT_MEM_EQ(zero_hash, p_h, 32, "zero hash");
-        cJSON_Delete(j);
-    }
-
-    return 1;
-}
 
 /* Test 2: Keysend preimage verification stress.
    Feed mismatched SHA256(preimage) != payment_hash, confirm correct behavior.
@@ -652,7 +556,7 @@ int test_prop_keysend_preimage_verify(void) {
         sha256(preimage, 32, correct_hash);
 
         /* Valid: register with correct hash should succeed */
-        int ok = lsp_channels_register_invoice(&mgr, correct_hash, preimage,
+        int ok = lsp_channels_register_invoice(&mgr, correct_hash,
                     trial % 4, 50000);
         TEST_ASSERT(ok || mgr.n_invoices >= mgr.invoices_cap,
                     "valid register failed (not full)");
@@ -682,7 +586,7 @@ int test_prop_keysend_preimage_verify(void) {
         sha256(pre, 32, hash);
         /* Re-init to avoid filling up */
         mgr.n_invoices = 0;
-        int ok = lsp_channels_register_invoice(&mgr, hash, pre, 0,
+        int ok = lsp_channels_register_invoice(&mgr, hash, 0,
                     boundary_amounts[i]);
         TEST_ASSERT(ok, "boundary amount register failed");
     }
@@ -772,7 +676,7 @@ int test_prop_invoice_registry_exhaustion(void) {
         for (int j = 0; j < 32; j++)
             pre[j] = (unsigned char)(rand_r(&seed) & 0xff);
         sha256(pre, 32, hash);
-        int ok = lsp_channels_register_invoice(&mgr, hash, pre, i % 4, 50000);
+        int ok = lsp_channels_register_invoice(&mgr, hash, i % 4, 50000);
         TEST_ASSERT(ok, "register should succeed");
     }
     TEST_ASSERT_EQ((long)mgr.n_invoices, (long)mgr.invoices_cap,
@@ -783,7 +687,7 @@ int test_prop_invoice_registry_exhaustion(void) {
         unsigned char pre[32], hash[32];
         memset(pre, 0xEE, 32);
         sha256(pre, 32, hash);
-        int ok = lsp_channels_register_invoice(&mgr, hash, pre, 0, 50000);
+        int ok = lsp_channels_register_invoice(&mgr, hash, 0, 50000);
         TEST_ASSERT(!ok, "65th register should fail");
     }
 
@@ -792,7 +696,7 @@ int test_prop_invoice_registry_exhaustion(void) {
         unsigned char pre[32], hash[32];
         memset(pre, 0xDD, 32);
         sha256(pre, 32, hash);
-        int ok = lsp_channels_register_invoice(&mgr, hash, pre, 0, 10000);
+        int ok = lsp_channels_register_invoice(&mgr, hash, 0, 10000);
         TEST_ASSERT(!ok, "keysend register when full should fail");
     }
 
@@ -823,101 +727,6 @@ int test_prop_invoice_registry_exhaustion(void) {
     return 1;
 }
 
-/* Test 5: Keysend + bridge integration via socketpair.
-   Full path: build keysend ADD_HTLC → send via socket → recv → parse →
-   register invoice → verify lookup → build fulfill → send back. */
-int test_prop_keysend_bridge_e2e(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-
-    secp256k1_context *ctx = secp256k1_context_create(
-        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-
-    unsigned int seed = 33;
-    invoice_entry_t *invoices_buf = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
-    if (!invoices_buf) return 0;
-    for (int trial = 0; trial < 50; trial++) {
-        unsigned char preimage[32], hash[32];
-        for (int i = 0; i < 32; i++)
-            preimage[i] = (unsigned char)(rand_r(&seed) & 0xff);
-        sha256(preimage, 32, hash);
-
-        uint64_t amount = 1000 + (rand_r(&seed) % 99000);
-        uint32_t cltv = 100 + (rand_r(&seed) % 500);
-        uint64_t htlc_id = rand_r(&seed) % 4000000000ULL;
-        size_t dest = rand_r(&seed) % 4;
-
-        /* Send keysend via socket */
-        cJSON *msg = wire_build_bridge_add_htlc_keysend(hash, amount * 1000,
-                        cltv, htlc_id, preimage, dest);
-        TEST_ASSERT(wire_send(sv[0], MSG_BRIDGE_ADD_HTLC, msg), "wire_send");
-        cJSON_Delete(msg);
-
-        /* Recv on other end */
-        wire_msg_t recv_msg;
-        TEST_ASSERT(wire_recv(sv[1], &recv_msg), "wire_recv");
-        TEST_ASSERT_EQ(recv_msg.msg_type, MSG_BRIDGE_ADD_HTLC, "msg type");
-
-        /* Parse keysend fields */
-        unsigned char p_hash[32], p_pre[32];
-        uint64_t p_amt, p_hid;
-        uint32_t p_cltv;
-        int p_ks = 0;
-        size_t p_dest = 99;
-        TEST_ASSERT(wire_parse_bridge_add_htlc_keysend(recv_msg.json, p_hash,
-                        &p_amt, &p_cltv, &p_hid, &p_ks, p_pre, &p_dest),
-                    "parse keysend");
-        TEST_ASSERT(p_ks == 1, "keysend flag");
-        TEST_ASSERT_MEM_EQ(hash, p_hash, 32, "hash");
-        TEST_ASSERT_MEM_EQ(preimage, p_pre, 32, "preimage");
-        TEST_ASSERT_EQ((long)p_dest, (long)dest, "dest");
-
-        /* Verify preimage→hash relationship */
-        unsigned char verify_hash[32];
-        sha256(p_pre, 32, verify_hash);
-        TEST_ASSERT_MEM_EQ(verify_hash, p_hash, 32, "SHA256 verify");
-
-        /* Register invoice and verify lookup */
-        lsp_channel_mgr_t mgr;
-        memset(&mgr, 0, sizeof(mgr));
-        mgr.invoices = invoices_buf;
-        mgr.invoices_cap = MAX_INVOICE_REGISTRY;
-        memset(invoices_buf, 0, MAX_INVOICE_REGISTRY * sizeof(invoice_entry_t));
-        mgr.ctx = ctx;
-        mgr.n_channels = 4;
-        TEST_ASSERT(lsp_channels_register_invoice(&mgr, p_hash, p_pre,
-                        p_dest, p_amt), "register");
-        size_t lookup_dest;
-        TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, p_hash, &lookup_dest),
-                    "lookup");
-        TEST_ASSERT_EQ((long)lookup_dest, (long)dest, "lookup dest");
-
-        /* Build fulfill and send back */
-        cJSON *ful = wire_build_bridge_fulfill_htlc(p_hash, p_pre, p_hid);
-        TEST_ASSERT(wire_send(sv[1], MSG_BRIDGE_FULFILL_HTLC, ful), "send ful");
-        cJSON_Delete(ful);
-
-        wire_msg_t ful_recv;
-        TEST_ASSERT(wire_recv(sv[0], &ful_recv), "recv ful");
-        TEST_ASSERT_EQ(ful_recv.msg_type, MSG_BRIDGE_FULFILL_HTLC, "ful type");
-
-        unsigned char f_hash[32], f_pre[32];
-        uint64_t f_hid;
-        TEST_ASSERT(wire_parse_bridge_fulfill_htlc(ful_recv.json, f_hash,
-                        f_pre, &f_hid), "parse ful");
-        TEST_ASSERT_MEM_EQ(hash, f_hash, 32, "ful hash");
-        TEST_ASSERT_MEM_EQ(preimage, f_pre, 32, "ful preimage");
-
-        cJSON_Delete(recv_msg.json);
-        cJSON_Delete(ful_recv.json);
-    }
-
-    free(invoices_buf);
-    close(sv[0]);
-    close(sv[1]);
-    secp256k1_context_destroy(ctx);
-    return 1;
-}
 
 /* Test 6: CLI command fuzzing.
    Feed random/malformed strings to handle_cli_line, verify no crashes. */
@@ -1101,7 +910,7 @@ int test_prop_keysend_invoice_collision(void) {
 
         /* Register normal invoice first */
         size_t normal_dest = trial % 4;
-        TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage,
+        TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash,
                         normal_dest, 50000), "register invoice");
 
         /* Lookup should find it with correct dest */
@@ -1113,7 +922,7 @@ int test_prop_keysend_invoice_collision(void) {
         /* Now simulate keysend arriving for same hash — should also register
            (different slot, both active) but lookup returns the FIRST match */
         size_t keysend_dest = (trial + 1) % 4;
-        int ks_ok = lsp_channels_register_invoice(&mgr, hash, preimage,
+        int ks_ok = lsp_channels_register_invoice(&mgr, hash,
                         keysend_dest, 50000);
         /* Should succeed (different slot) */
         TEST_ASSERT(ks_ok, "keysend register should succeed (different slot)");

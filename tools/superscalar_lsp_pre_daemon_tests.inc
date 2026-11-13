@@ -1246,8 +1246,6 @@
             size_t dest_client = 0;
             uint64_t amount_msat = 1000000;  /* 1000 sats */
             unsigned char test_hash[32];
-            unsigned char test_preimage[32];
-            memset(test_preimage, 0, 32);
 
             {
                 cJSON *inv_req = cJSON_CreateObject();
@@ -1283,13 +1281,8 @@
                             hex_decode(hash_j->valuestring, test_hash, 32);
                         got_invoice_created = 1;
                     } else if (m.msg_type == MSG_REGISTER_INVOICE && !got_register_invoice) {
-                        unsigned char rh[32] = {0}, rp[32] = {0};
-                        cJSON *rhj = cJSON_GetObjectItem(m.json, "payment_hash");
-                        cJSON *rpj = cJSON_GetObjectItem(m.json, "preimage");
-                        if (rhj && rhj->valuestring) hex_decode(rhj->valuestring, rh, 32);
-                        if (rpj && rpj->valuestring) hex_decode(rpj->valuestring, rp, 32);
-                        lsp_channels_register_invoice(mgr, rh, rp, dest_client, amount_msat);
-                        memcpy(test_preimage, rp, 32);
+                        /* the hash only: the client keeps the preimage */
+                        lsp_channels_handle_msg(mgr, lsp_p, dest_client, &m);
                         got_register_invoice = 1;
                     }
                     cJSON_Delete(m.json);
@@ -1376,7 +1369,11 @@
                                                       got_hash, got_preimage,
                                                       &got_htlc_id)) {
                     int hash_ok = (memcmp(got_hash, test_hash, 32) == 0);
-                    int preimage_ok = (memcmp(got_preimage, test_preimage, 32) == 0);
+                    /* The client released its own preimage; the LSP first
+                       learns it here, from the client's fulfil. */
+                    unsigned char got_hash_of[32];
+                    sha256(got_preimage, 32, got_hash_of);
+                    int preimage_ok = (memcmp(got_hash_of, test_hash, 32) == 0);
                     printf("Bridge: received FULFILL_HTLC (htlc_id=%llu, "
                            "hash_ok=%d, preimage_ok=%d)\n",
                            (unsigned long long)got_htlc_id, hash_ok, preimage_ok);

@@ -2915,7 +2915,7 @@ int test_reconnect_htlc_replay(void) {
     memset(preimage, 0xBB, 32);
     sha256(preimage, 32, payment_hash);
 
-    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, preimage, 1, 1000000),
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, payment_hash, 1, 1000000),
                 "register invoice failed");
 
     /* Add an ACTIVE RECEIVED HTLC on client 0's channel (sender side) */

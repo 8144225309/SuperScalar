@@ -8,6 +8,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/network.h"
+#include "superscalar/invoice.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
@@ -537,9 +538,19 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 typedef struct {
     unsigned char payment_hash[32];
     unsigned char preimage[32];
+    unsigned char payment_secret[32];  /* of the BOLT 11 invoice we signed */
+    int has_secret;                    /* 0: an invoice for a payment inside
+                                          the factory, paid without an onion */
     uint64_t amount_msat;
     int active;
 } client_invoice_t;
+
+/* What the onion of each incoming HTLC said to us, by HTLC id */
+typedef struct {
+    uint64_t htlc_id;
+    client_final_hop_t hop;
+    int used;
+} client_hop_slot_t;
 
 /* Per-fd message inbox: queues messages that arrive out-of-order while
    recv_or_handle_ptlc is blocking for a specific message type.
@@ -590,6 +601,8 @@ typedef struct {
     int saved_initial;  /* 1 after first save of factory+channel */
     client_invoice_t invoices[MAX_CLIENT_INVOICES];
     size_t n_invoices;
+    client_hop_slot_t hops[MAX_HTLCS];
+    const char *network;    /* for the invoices this member signs */
     watchtower_t *wt;
     fee_estimator_t *fee;
     regtest_t *rt;
@@ -1203,7 +1216,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     inv->active = 1;
                     if (cbd->db)
                         persist_save_client_invoice(cbd->db, inv->payment_hash,
-                                                    inv->preimage, inv->amount_msat);
+                                                    inv->preimage, NULL,
+                                                    inv->amount_msat);
                     printf("Client %u: RECV armed (auto-fulfill preimage registered)\n",
                            my_index);
                 }
@@ -1450,6 +1464,28 @@ handle_message:
                 secure_zero(sett_preimage, sizeof(sett_preimage));
                 break;
             }
+            /* The onion of an outside payment is for us alone: decode it
+               with our own key and keep what it says for the settle check */
+            if (cbd && ch->n_htlcs > 0) {
+                const htlc_t *nh = &ch->htlcs[ch->n_htlcs - 1];
+                client_hop_slot_t *slot = NULL;
+                for (size_t k = 0; k < MAX_HTLCS && !slot; k++)
+                    if (!cbd->hops[k].used) slot = &cbd->hops[k];
+                if (!slot) slot = &cbd->hops[nh->id % MAX_HTLCS];
+                memset(slot, 0, sizeof(*slot));
+                slot->htlc_id = nh->id;
+                slot->used = 1;
+                unsigned char onion[ONION_WIRE_SIZE];
+                int og = wire_get_onion(msg.json, onion);
+                if (og != 0) {
+                    unsigned char sk[32];
+                    slot->hop.present = 1;
+                    if (og > 0 && secp256k1_keypair_sec(ctx, sk, keypair))
+                        client_decode_final_hop(ctx, sk, onion,
+                                                nh->payment_hash, &slot->hop);
+                    secure_zero(sk, sizeof(sk));
+                }
+            }
             cJSON_Delete(msg.json);
 
             /* Wait for COMMITMENT_SIGNED (5s timeout), handling PTLC_PRESIG
@@ -1560,11 +1596,19 @@ handle_message:
                                 ch->htlcs[h].direction == HTLC_RECEIVED)
                                 rh = &ch->htlcs[h];
                         uint32_t tip = client_chain_tip();
+                        const client_final_hop_t *hop = NULL;
+                        for (size_t k = 0; k < MAX_HTLCS; k++)
+                            if (cbd->hops[k].used &&
+                                cbd->hops[k].htlc_id == htlc_id)
+                                hop = &cbd->hops[k].hop;
+                        const unsigned char *isec = paid_inv->has_secret
+                                                    ? paid_inv->payment_secret
+                                                    : NULL;
                         if (!client_htlc_pays_invoice(rh, paid_inv->amount_msat,
-                                                      tip)) {
+                                                      isec, hop, tip)) {
                             client_settle_invoice_htlc(fd, ch, htlc_id,
                                 paid_inv->preimage, paid_inv->amount_msat,
-                                tip);
+                                isec, hop, tip);
                             if (cbd && cbd->db)
                                 persist_update_channel_balance(cbd->db, my_index - 1,
                                     ch->local_amount, ch->remote_amount,
@@ -1791,9 +1835,16 @@ handle_message:
         }
 
         case MSG_CREATE_INVOICE: {
-            /* LSP asks us to create an invoice (Phase 17) */
+            /* The LSP asks us for an invoice.  We make the preimage (and,
+               for an invoice outside payers can pay, the payment secret and
+               a BOLT 11 invoice signed with our own key, routed through the
+               LSP's node) and keep them: the LSP is told the hash only. */
             uint64_t inv_amount_msat;
-            if (!wire_parse_create_invoice(msg.json, &inv_amount_msat)) {
+            wire_route_hint_t hint;
+            int has_hint = msg.json ? wire_create_invoice_get_hint(msg.json, &hint)
+                                    : 0;
+            if (!wire_parse_create_invoice(msg.json, &inv_amount_msat) ||
+                has_hint < 0) {
                 fprintf(stderr, "Client %u: bad CREATE_INVOICE\n", my_index);
                 cJSON_Delete(msg.json);
                 break;
@@ -1802,12 +1853,43 @@ handle_message:
 
             if (cbd && cbd->n_invoices < MAX_CLIENT_INVOICES) {
                 client_invoice_t *inv = &cbd->invoices[cbd->n_invoices];
-
-                /* A fresh random preimage, or no invoice at all */
-                if (!client_new_invoice_preimage(inv->preimage,
-                                                 inv->payment_hash)) {
-                    fprintf(stderr, "Client %u: no randomness for an invoice "
-                            "preimage; no invoice created\n", my_index);
+                memset(inv, 0, sizeof(*inv));
+                char bolt11[2048];
+                bolt11[0] = '\0';
+                int made = 0;
+                if (has_hint) {
+                    bolt11_invoice_table_t *tbl = calloc(1, sizeof(*tbl));
+                    unsigned char sk[32];
+                    if (tbl && secp256k1_keypair_sec(ctx, sk, keypair)) {
+                        invoice_init(tbl);
+                        made = invoice_create_with_hint(tbl, ctx, sk,
+                            cbd->network ? cbd->network : "regtest",
+                            inv_amount_msat, "SuperScalar member invoice", 0,
+                            hint.node_id, hint.scid, hint.fee_base_msat,
+                            hint.fee_ppm, hint.cltv_delta,
+                            bolt11, sizeof(bolt11));
+                        for (int e = 0; made && e < INVOICE_TABLE_MAX; e++) {
+                            if (!tbl->entries[e].active) continue;
+                            memcpy(inv->preimage, tbl->entries[e].preimage, 32);
+                            memcpy(inv->payment_hash, tbl->entries[e].payment_hash, 32);
+                            memcpy(inv->payment_secret,
+                                   tbl->entries[e].payment_secret, 32);
+                            inv->has_secret = 1;
+                            break;
+                        }
+                        made = made && inv->has_secret;
+                    }
+                    secure_zero(sk, sizeof(sk));
+                    if (tbl) { secure_zero(tbl, sizeof(*tbl)); free(tbl); }
+                } else {
+                    /* A fresh random preimage, or no invoice at all */
+                    made = client_new_invoice_preimage(inv->preimage,
+                                                       inv->payment_hash);
+                }
+                if (!made) {
+                    fprintf(stderr, "Client %u: could not create an invoice; "
+                            "none created\n", my_index);
+                    secure_zero(inv, sizeof(*inv));
                     cJSON *err = wire_build_error("cannot create invoice");
                     if (err) {
                         wire_send(fd, MSG_ERROR, err);
@@ -1822,43 +1904,30 @@ handle_message:
                 /* Persist client invoice (Phase 23) */
                 if (cbd->db)
                     persist_save_client_invoice(cbd->db, inv->payment_hash,
-                                                inv->preimage, inv_amount_msat);
+                        inv->preimage, inv->has_secret ? inv->payment_secret : NULL,
+                        inv_amount_msat);
 
                 printf("Client %u: created invoice for %llu msat\n",
                        my_index, (unsigned long long)inv_amount_msat);
+                if (bolt11[0])
+                    printf("Client %u: BOLT11 invoice ready:\n%s\n",
+                           my_index, bolt11);
 
-                /* Send MSG_INVOICE_CREATED back to LSP */
+                /* Send MSG_INVOICE_CREATED back to LSP (hash, our BOLT 11) */
                 cJSON *reply = wire_build_invoice_created(inv->payment_hash,
                                                             inv_amount_msat);
+                if (bolt11[0]) wire_invoice_created_set_bolt11(reply, bolt11);
                 wire_send(fd, MSG_INVOICE_CREATED, reply);
                 cJSON_Delete(reply);
 
-                /* Also register with LSP so it knows to route to us */
+                /* Register the hash with the LSP so it can route to us */
                 uint32_t client_idx = my_index - 1;
                 cJSON *reg = wire_build_register_invoice(inv->payment_hash,
-                                                           inv->preimage,
                                                            inv_amount_msat,
                                                            (size_t)client_idx);
                 wire_send(fd, MSG_REGISTER_INVOICE, reg);
                 cJSON_Delete(reg);
             }
-            break;
-        }
-
-        case MSG_INVOICE_BOLT11: {
-            /* LSP forwarded a BOLT11 invoice string from CLN */
-            unsigned char bolt11_hash[32];
-            char bolt11_str[2048];
-            if (!wire_parse_invoice_bolt11(msg.json, bolt11_hash,
-                                             bolt11_str, sizeof(bolt11_str))) {
-                fprintf(stderr, "Client %u: bad INVOICE_BOLT11\n", my_index);
-                cJSON_Delete(msg.json);
-                break;
-            }
-            cJSON_Delete(msg.json);
-
-            printf("Client %u: BOLT11 invoice ready:\n%s\n",
-                   my_index, bolt11_str);
             break;
         }
 
@@ -1942,28 +2011,6 @@ handle_message:
             /* Keepalive response: discard */
             cJSON_Delete(msg.json);
             break;
-
-        case MSG_DELIVER_PREIMAGE: {
-            /* LSP delivers preimage for an admin-created invoice.
-               Store it so we can fulfill the HTLC when it arrives. */
-            unsigned char dp_hash[32], dp_preimage[32];
-            if (msg.json &&
-                wire_json_get_hex(msg.json, "payment_hash", dp_hash, 32) == 32 &&
-                wire_json_get_hex(msg.json, "preimage", dp_preimage, 32) == 32) {
-                if (cbd && cbd->n_invoices < MAX_CLIENT_INVOICES) {
-                    client_invoice_t *inv = &cbd->invoices[cbd->n_invoices];
-                    memcpy(inv->payment_hash, dp_hash, 32);
-                    memcpy(inv->preimage, dp_preimage, 32);
-                    cJSON *amt = cJSON_GetObjectItem(msg.json, "amount_msat");
-                    inv->amount_msat = amt ? (uint64_t)amt->valuedouble : 0;
-                    inv->active = 1;
-                    cbd->n_invoices++;
-                    printf("Client %u: stored preimage for admin invoice\n", my_index);
-                }
-            }
-            cJSON_Delete(msg.json);
-            break;
-        }
 
         case MSG_JIT_OFFER: {
             /* LSP offers a JIT channel — non-blocking state machine */
@@ -4273,6 +4320,7 @@ int main(int argc, char *argv[]) {
         daemon_cb_data_t cbd;
         memset(&cbd, 0, sizeof(cbd));
         cbd.db = use_db ? &db : NULL;
+        cbd.network = network;
         cbd.wt = &client_wt;
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
@@ -4288,16 +4336,24 @@ int main(int argc, char *argv[]) {
         if (use_db) {
             unsigned char ci_hashes[MAX_CLIENT_INVOICES][32];
             unsigned char ci_preimages[MAX_CLIENT_INVOICES][32];
+            unsigned char ci_secrets[MAX_CLIENT_INVOICES][32];
+            int ci_has_secret[MAX_CLIENT_INVOICES];
             uint64_t ci_amounts[MAX_CLIENT_INVOICES];
             size_t n_ci = persist_load_client_invoices(&db,
-                ci_hashes, ci_preimages, ci_amounts, MAX_CLIENT_INVOICES);
+                ci_hashes, ci_preimages, ci_secrets, ci_has_secret,
+                ci_amounts, MAX_CLIENT_INVOICES);
             for (size_t i = 0; i < n_ci && cbd.n_invoices < MAX_CLIENT_INVOICES; i++) {
                 client_invoice_t *inv = &cbd.invoices[cbd.n_invoices++];
+                memset(inv, 0, sizeof(*inv));
                 memcpy(inv->payment_hash, ci_hashes[i], 32);
                 memcpy(inv->preimage, ci_preimages[i], 32);
+                memcpy(inv->payment_secret, ci_secrets[i], 32);
+                inv->has_secret = ci_has_secret[i];
                 inv->amount_msat = ci_amounts[i];
                 inv->active = 1;
             }
+            secure_zero(ci_preimages, sizeof(ci_preimages));
+            secure_zero(ci_secrets, sizeof(ci_secrets));
             if (n_ci > 0)
                 printf("Client: loaded %zu invoices from DB\n", n_ci);
 
@@ -4506,6 +4562,7 @@ int main(int argc, char *argv[]) {
             daemon_cb_data_t cbd;
             memset(&cbd, 0, sizeof(cbd));
             cbd.db  = use_db ? &db : NULL;
+            cbd.network = network;
             cbd.wt  = &client_wt;
             cbd.fee = client_fee_ptr;
             cbd.rt  = rt_ok ? &rt : NULL;

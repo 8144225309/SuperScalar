@@ -10,7 +10,6 @@
 
 /* --- Message types --- */
 #define MSG_HELLO              0x01
-#define MSG_DELIVER_PREIMAGE   0x72  /* LSP → Client: preimage for admin-created invoice */
 #define MSG_PING               0x70  /* Keepalive: either side sends */
 #define MSG_PONG               0x71  /* Keepalive response */
 #define MSG_HELLO_ACK          0x02
@@ -34,7 +33,6 @@
 #define MSG_CLOSE_REQUEST      0x36
 #define MSG_CHANNEL_NONCES     0x37   /* batch of pubnonces for channel signing */
 #define MSG_REGISTER_INVOICE   0x38   /* Client → LSP: register payment hash for inbound */
-#define MSG_INVOICE_BOLT11     0x39   /* LSP → Client: BOLT11 string from CLN */
 
 /* Bridge messages (Phase 14) */
 #define MSG_BRIDGE_HELLO        0x40  /* Bridge → LSP: identify as bridge */
@@ -477,14 +475,14 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 unsigned char pubnonces_out[][66],
                                 size_t max_nonces, size_t *count_out);
 
-/* Client → LSP: REGISTER_INVOICE {payment_hash, preimage, amount_msat, dest_client} */
+/* Client → LSP: REGISTER_INVOICE {payment_hash, amount_msat, dest_client}.
+   The member keeps the preimage; the LSP is told only the hash it routes
+   by.  The parser refuses a message that carries a "preimage". */
 cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
-                                     const unsigned char *preimage32,
                                      uint64_t amount_msat, size_t dest_client);
 
 int wire_parse_register_invoice(const cJSON *json,
                                   unsigned char *payment_hash32,
-                                  unsigned char *preimage32,
                                   uint64_t *amount_msat, size_t *dest_client);
 
 /* --- Bridge message builders (Phase 14) --- */
@@ -684,18 +682,12 @@ int    wire_parse_factory_client_final_psigs(const cJSON *json,
 /* LSP → Bridge: BRIDGE_HELLO_ACK {} */
 cJSON *wire_build_bridge_hello_ack(void);
 
-/* Bridge → LSP: BRIDGE_ADD_HTLC {payment_hash, amount_msat, cltv_expiry, htlc_id,
-   [keysend], [dest_client], [preimage]} — keysend fields optional (backward-compat) */
+/* Bridge → LSP: BRIDGE_ADD_HTLC {payment_hash, amount_msat, cltv_expiry,
+   htlc_id, [upstream_id], [onion]}.  "onion" is the packet for the member
+   (the Lightning node's next_onion), passed on to it unopened. */
 cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
                                     uint64_t amount_msat, uint32_t cltv_expiry,
                                     uint64_t htlc_id);
-
-/* Keysend variant: includes preimage + dest_client for spontaneous payments */
-cJSON *wire_build_bridge_add_htlc_keysend(const unsigned char *payment_hash32,
-                                            uint64_t amount_msat, uint32_t cltv_expiry,
-                                            uint64_t htlc_id,
-                                            const unsigned char *preimage32,
-                                            size_t dest_client);
 
 /* LSP → Bridge: BRIDGE_FULFILL_HTLC {payment_hash, preimage, htlc_id} */
 cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
@@ -747,9 +739,11 @@ int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
 cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
                                       const unsigned char *preimage32);
 
-/* LSP → Bridge: BRIDGE_REGISTER {payment_hash, preimage, amount_msat, dest_client} */
+/* LSP → Bridge: BRIDGE_REGISTER {payment_hash, amount_msat, dest_client}.
+   The hash of a member invoice, so the node knows a payment for it is a
+   member's; never its preimage.  The parser refuses one that carries a
+   "preimage". */
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
-                                    const unsigned char *preimage32,
                                     uint64_t amount_msat, size_t dest_client);
 
 /* --- Bridge message parsers (Phase 14) --- */
@@ -759,16 +753,12 @@ int wire_parse_bridge_add_htlc(const cJSON *json,
                                  uint64_t *amount_msat, uint32_t *cltv_expiry,
                                  uint64_t *htlc_id);
 
-/* Extended parser: also extracts optional keysend fields.
-   *is_keysend_out=1 if keysend present, preimage32/dest_client_out filled.
-   *is_keysend_out=0 if absent (backward-compatible). */
-int wire_parse_bridge_add_htlc_keysend(const cJSON *json,
-                                         unsigned char *payment_hash32,
-                                         uint64_t *amount_msat, uint32_t *cltv_expiry,
-                                         uint64_t *htlc_id,
-                                         int *is_keysend_out,
-                                         unsigned char *preimage32,
-                                         size_t *dest_client_out);
+/* The onion a BRIDGE_ADD_HTLC or UPDATE_ADD_HTLC carries for the member
+   ("onion", ONION_WIRE_SIZE bytes hex).  get: 1 if present and well formed,
+   0 if absent, -1 if malformed. */
+#define ONION_WIRE_SIZE 1366
+void wire_set_onion(cJSON *json, const unsigned char onion[ONION_WIRE_SIZE]);
+int wire_get_onion(const cJSON *json, unsigned char onion_out[ONION_WIRE_SIZE]);
 
 int wire_parse_bridge_fulfill_htlc(const cJSON *json,
                                      unsigned char *payment_hash32,
@@ -793,16 +783,7 @@ int wire_parse_bridge_pay_result(const cJSON *json,
 
 int wire_parse_bridge_register(const cJSON *json,
                                  unsigned char *payment_hash32,
-                                 unsigned char *preimage32,
                                  uint64_t *amount_msat, size_t *dest_client);
-
-/* LSP → Client: INVOICE_BOLT11 {payment_hash, bolt11} */
-cJSON *wire_build_invoice_bolt11(const unsigned char *payment_hash32,
-                                   const char *bolt11);
-
-int wire_parse_invoice_bolt11(const cJSON *json,
-                                unsigned char *payment_hash32,
-                                char *bolt11, size_t bolt11_len);
 
 /* --- Reconnection messages (Phase 16) --- */
 
@@ -828,18 +809,39 @@ int wire_parse_reconnect_ack(const cJSON *json, uint32_t *channel_id,
 
 /* --- Invoice messages (Phase 17) --- */
 
-/* LSP → Client: CREATE_INVOICE {amount_msat} */
+/* LSP → Client: CREATE_INVOICE {amount_msat, [route_hint]}.  With a
+   route hint the member makes a BOLT11 invoice it signs itself, payable
+   through the hinted hop (the LSP's Lightning node). */
 cJSON *wire_build_create_invoice(uint64_t amount_msat);
 
 int wire_parse_create_invoice(const cJSON *json, uint64_t *amount_msat);
 
-/* Client → LSP: INVOICE_CREATED {payment_hash, amount_msat} */
+/* The last hop to a member, as the member's invoice advertises it. */
+typedef struct {
+    unsigned char node_id[33];  /* the hop's node (compressed pubkey) */
+    uint64_t scid;
+    uint32_t fee_base_msat;
+    uint32_t fee_ppm;
+    uint16_t cltv_delta;
+} wire_route_hint_t;
+
+void wire_create_invoice_set_hint(cJSON *json, const wire_route_hint_t *hint);
+/* 1 if a well-formed hint is present, 0 if none, -1 if malformed. */
+int wire_create_invoice_get_hint(const cJSON *json, wire_route_hint_t *hint_out);
+
+/* Client → LSP: INVOICE_CREATED {payment_hash, amount_msat, [bolt11]}.
+   bolt11 is the member-signed invoice when CREATE_INVOICE had a hint. */
 cJSON *wire_build_invoice_created(const unsigned char *payment_hash32,
                                     uint64_t amount_msat);
 
 int wire_parse_invoice_created(const cJSON *json,
                                  unsigned char *payment_hash32,
                                  uint64_t *amount_msat);
+
+void wire_invoice_created_set_bolt11(cJSON *json, const char *bolt11);
+/* 1 and the string in bolt11_out if present and it fits, 0 otherwise. */
+int wire_invoice_created_get_bolt11(const cJSON *json, char *bolt11_out,
+                                    size_t cap);
 
 /* --- PTLC key turnover messages (Tier 3) --- */
 

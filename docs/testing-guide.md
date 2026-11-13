@@ -367,16 +367,16 @@ The CLN bridge has dedicated tests across all three tiers: unit, reliability, an
 |------|-----------------|
 | `test_bridge_msg_round_trip` | Build/parse cycle for all bridge wire message types |
 | `test_bridge_hello_handshake` | HELLO → HELLO_ACK handshake over socketpair |
-| `test_bridge_invoice_registry` | Register invoice, lookup by payment_hash, verify preimage stored |
+| `test_bridge_invoice_registry` | Register a client invoice by its hash, lookup by payment_hash |
 | `test_bridge_inbound_flow` | BRIDGE_ADD_HTLC → channel ADD_HTLC → FULFILL → BRIDGE_FULFILL pipeline |
 | `test_bridge_outbound_flow` | Client-initiated outbound payment via BRIDGE_SEND_PAY → PAY_RESULT |
 | `test_bridge_unknown_hash` | ADD_HTLC with unregistered payment_hash returns BRIDGE_FAIL_HTLC |
 | `test_bridge_register_forward` | LSP forwards BRIDGE_REGISTER to bridge_fd when connected |
 | `test_bridge_set_nk_pubkey` | NK pubkey pinning for authenticated Noise handshake |
 | `test_bridge_htlc_timeout` | HTLC timeout enforcement when block height approaches CLTV expiry |
-| `test_bridge_invoice_bolt11_round_trip` | INVOICE_BOLT11 wire message build → send → recv → parse |
-| `test_bridge_bolt11_plugin_to_lsp` | Plugin sends invoice_bolt11 JSON → bridge → MSG_INVOICE_BOLT11 to LSP |
-| `test_bridge_preimage_passthrough` | BRIDGE_REGISTER includes preimage, forwarded correctly to plugin |
+| `test_bridge_invoice_bolt11_round_trip` | Client invoice messages carry the hash only; one offering a preimage is refused; onion, route hint and BOLT11 round trips |
+| `test_bridge_bolt11_plugin_to_lsp` | The plugin's onion for the client (next_onion) reaches the LSP unchanged |
+| `test_bridge_preimage_passthrough` | BRIDGE_REGISTER gives the plugin the hash only; one with a preimage is refused |
 | `test_bridge_heartbeat_stale` | Heartbeat detects stale connections after timeout |
 | `test_bridge_heartbeat_config` | Default interval, custom interval, zero/negative fallback to 30s |
 
@@ -394,7 +394,7 @@ The CLN bridge has dedicated tests across all three tiers: unit, reliability, an
 |------|-----------------|
 | `test_regtest_bridge_nk_handshake` | NK-authenticated Noise handshake between bridge and LSP over real TCP |
 | `test_regtest_bridge_payment` | Full inbound payment: BRIDGE_ADD_HTLC → client fulfill → BRIDGE_FULFILL_HTLC |
-| `test_regtest_bridge_invoice_flow` | Full invoice lifecycle: client REGISTER_INVOICE → BRIDGE_REGISTER → BOLT11 return → ADD_HTLC → fulfill |
+| `test_regtest_bridge_invoice_flow` | A client's own invoice paid from outside: the client signs it, the LSP and bridge see the hash only, the payer's onion reaches the client, and the client settles with its own preimage (absent from everything the LSP and bridge held before) |
 
 ### Q&A: Adversarial Bridge Scenarios
 
@@ -410,9 +410,9 @@ The LSP detects the stale bridge_fd via heartbeat timeout. Any in-flight bridge-
 
 The LSP registers the invoice locally (so future inbound HTLCs can be routed) but skips the `MSG_BRIDGE_REGISTER` forward since `bridge_fd < 0`. The client can re-register after the bridge connects. The invoice stays in the LSP's registry regardless.
 
-**Q: What if the BOLT11 invoice arrives before the client registers?**
+**Q: Can the LSP or CLN settle a client's payment without the client?**
 
-The LSP receives `MSG_INVOICE_BOLT11` from the bridge but `lsp_channels_lookup_invoice` fails because no matching payment_hash exists in the registry. The LSP logs "INVOICE_BOLT11 for unknown hash" and drops the message. The client must register first.
+No. The client makes the preimage and keeps it; the LSP, the bridge and CLN are told only the payment hash, and learn the preimage from the client's fulfil. A REGISTER_INVOICE or BRIDGE_REGISTER that offers a preimage is refused.
 
 ---
 

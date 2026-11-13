@@ -265,6 +265,22 @@ int ln_dispatch_process_msg(ln_dispatch_t *d, int peer_idx,
         if (result == FORWARD_RELAY) {
             htlc_forward_entry_t *fe = &d->fwd->entries[d->fwd->count - 1];
             memcpy(fe->in_channel_id, p, 32); /* p[0..31] = channel_id */
+            /* A payment for a factory member: members are reached through
+               the bridge, and this node has no preimage to settle one
+               with.  Fail it back at once rather than leave it pending. */
+            if (d->member_hint_scid != 0 &&
+                fe->next_hop_scid == d->member_hint_scid) {
+                fe->state = FORWARD_STATE_FAILED;
+                if (d->pmgr && peer_idx >= 0) {
+                    static const unsigned char unknown_next_peer[2] = {0x40, 0x0A};
+                    htlc_commit_send_fail(d->pmgr, peer_idx, p, htlc_id,
+                                          unknown_next_peer,
+                                          sizeof(unknown_next_peer));
+                }
+                fprintf(stderr, "ln_dispatch: HTLC %llu for a factory member "
+                        "refused on this node (members are paid through "
+                        "the bridge)\n", (unsigned long long)htlc_id);
+            }
         }
         return (int)msg_type;
     }
