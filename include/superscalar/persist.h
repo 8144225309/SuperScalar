@@ -756,6 +756,12 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 
 /* Save all tree nodes for a factory (includes signed_tx_hex if available). */
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id);
+/* The signed transaction stored for one tree node (tx_buf_init'ed into out).
+   persist_load_factory checks every stored row against the rebuilt tree and
+   its signature, but keeps the rebuilt (unsigned) bytes where they match;
+   this fetches the signed ones.  Returns 1 if found. */
+int persist_load_tree_node_signed_tx(persist_t *p, uint32_t factory_id,
+                                     uint32_t node_index, tx_buf_t *out);
 
 /* --- Broadcast audit log --- */
 
@@ -1427,9 +1433,13 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
 
 /* --- The LSP's own commitment signature (co-signed by the member) --- */
 int persist_save_host_commitment(persist_t *p, uint32_t channel_id,
-                                 uint64_t commitment_number, const unsigned char sig64[64]);
+                                 uint64_t commitment_number, const unsigned char sig64[64],
+                                 const unsigned char txid32[32],
+                                 const unsigned char *tx, size_t tx_len);
 int persist_load_host_commitment(persist_t *p, uint32_t channel_id,
-                                 uint64_t *commitment_number_out, unsigned char sig64_out[64]);
+                                 uint64_t *commitment_number_out, unsigned char sig64_out[64],
+                                 unsigned char txid_out32[32],
+                                 unsigned char *tx_out, size_t tx_max, size_t *tx_len_out);
 
 /* --- End-date payouts --- */
 typedef struct {

@@ -21,6 +21,9 @@
 #include "superscalar/client.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/wire.h"
+#include "superscalar/persist.h"
+#include "superscalar/cli_arity.h"
+#include "superscalar/lsp.h"
 #include "cJSON.h"
 
 /* BIP-341 key-only output key: internal + H_TapTweak(internal) * G. */
@@ -34,6 +37,7 @@ static int keyonly_tweak(const secp256k1_context *ctx, secp256k1_xonly_pubkey *o
            secp256k1_xonly_pubkey_from_pubkey(ctx, out, NULL, &full);
 }
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <secp256k1_schnorrsig.h>
 #include <stdio.h>
@@ -1134,6 +1138,390 @@ int test_end_date_member_waits_for_host_revocation(void) {
     channel_cleanup(cli_ch);
     free(lsp_ch);
     free(cli_ch);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+/* Commitment 0 co-signed both ways, as at channel open. */
+static int ep_open_cosigned(secp256k1_context *ctx, channel_t *lsp_ch, channel_t *cli_ch) {
+    unsigned char ps[32];
+    uint32_t ni;
+    if (!channel_create_commitment_partial_sig(lsp_ch, ps, &ni)) return 0;
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = MSG_COMMITMENT_SIGNED;
+    m.json = wire_build_commitment_signed(0, 0, ps, ni);
+    int ok = client_handle_initial_commitment_signed(cli_ch, &m);
+    cJSON_Delete(m.json);
+    cJSON *reply = cJSON_CreateObject();
+    ok = ok && client_add_host_commit_sig(cli_ch, reply) && lsp_take_host_commit_sig(lsp_ch, reply);
+    cJSON_Delete(reply);
+    (void)ctx;
+    return ok;
+}
+
+/* Move 5000 sat to the member and have the LSP sign the member's commitment 1. */
+static int ep_update_to_1(channel_t *lsp_ch, channel_t *cli_ch, wire_msg_t *cs_out) {
+    lsp_ch->commitment_number = cli_ch->commitment_number = 1;
+    channel_generate_local_pcs(lsp_ch, 2);
+    channel_generate_local_pcs(cli_ch, 2);
+    lsp_ch->remote_amount += 5000; lsp_ch->local_amount -= 5000;
+    cli_ch->local_amount += 5000;  cli_ch->remote_amount -= 5000;
+    unsigned char ps[32];
+    uint32_t ni;
+    if (!channel_create_commitment_partial_sig(lsp_ch, ps, &ni)) return 0;
+    memset(cs_out, 0, sizeof(*cs_out));
+    cs_out->msg_type = MSG_COMMITMENT_SIGNED;
+    cs_out->json = wire_build_commitment_signed(0, 1, ps, ni);
+    return cs_out->json != NULL;
+}
+
+/* An update is taken only with the member's signature over the LSP's
+   commitment at the new number.  The LSP refuses a REVOKE_AND_ACK without
+   it (as one whose signature does not verify): it takes no revocation,
+   keeps the LSP commitment it holds (the previous one, co-signed and not
+   revoked) and the channel takes no further update.  A member that cannot
+   co-sign sends no revocation: it fails the update with an error. */
+int test_end_date_update_needs_host_cosig(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x5E, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+
+    for (int side = 0; side < 2; side++) {
+        channel_t *lsp_ch = calloc(1, sizeof(channel_t)), *cli_ch = calloc(1, sizeof(channel_t));
+        TEST_ASSERT(lsp_ch && cli_ch, "alloc");
+        TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+        TEST_ASSERT(ep_open_cosigned(ctx, lsp_ch, cli_ch), "commitment 0 co-signed");
+        unsigned char held0[32];
+        memcpy(held0, lsp_ch->host_commit_txid, 32);
+        TEST_ASSERT(lsp_ch->host_commit_tx_len > 0, "LSP holds its commitment 0");
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        wire_msg_t cs;
+        if (side == 1) {
+            /* the member has no nonce left to co-sign with */
+            cli_ch->remote_nonce_next = cli_ch->remote_nonce_count;
+        }
+        TEST_ASSERT(ep_update_to_1(lsp_ch, cli_ch, &cs), "LSP signs the member's commitment 1");
+        int handled = client_handle_commitment_signed(sv[1], cli_ch, ctx, &cs);
+        cJSON_Delete(cs.json);
+        wire_msg_t ack;
+        memset(&ack, 0, sizeof(ack));
+        TEST_ASSERT(wire_recv_timeout(sv[0], &ack, 5), "reply from the member");
+        if (side == 0) {
+            TEST_ASSERT(handled && ack.msg_type == MSG_REVOKE_AND_ACK, "member revokes");
+            cJSON_DeleteItemFromObject(ack.json, "host_commit_psig");
+            cJSON_DeleteItemFromObject(ack.json, "host_commit_nonce_index");
+            uint32_t cid;
+            unsigned char sec[32], np[33];
+            TEST_ASSERT(!lsp_parse_member_revoke(lsp_ch, ack.json, &cid, sec, np),
+                        "a revocation without the co-signature is refused");
+            TEST_ASSERT(lsp_ch->host_commit_refused, "the channel takes no further update");
+            TEST_ASSERT(!channel_get_received_revocation(lsp_ch, 0, sec),
+                        "no revocation taken");
+            TEST_ASSERT(lsp_ch->latest_commitment_sig_cn == 0 &&
+                        memcmp(lsp_ch->host_commit_txid, held0, 32) == 0,
+                        "the LSP still holds its co-signed commitment 0");
+            unsigned char ps[32];
+            uint32_t ni;
+            TEST_ASSERT(!channel_create_commitment_partial_sig(lsp_ch, ps, &ni),
+                        "no new commitment is signed on the channel");
+        } else {
+            TEST_ASSERT(!handled, "the member fails the update");
+            TEST_ASSERT(ack.msg_type != MSG_REVOKE_AND_ACK,
+                        "no revocation without the co-signature");
+            TEST_ASSERT(ack.msg_type == MSG_ERROR, "the member reports the failed update");
+        }
+        if (ack.json) cJSON_Delete(ack.json);
+        close(sv[0]);
+        close(sv[1]);
+        channel_cleanup(lsp_ch);
+        channel_cleanup(cli_ch);
+        free(lsp_ch);
+        free(cli_ch);
+    }
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The preimage rule holds after the member's channel is rebuilt from its
+   database, as a restart or a reconnect does (client_run_reconnect): an
+   unrevoked older LSP commitment still blocks the preimage; once the LSP's
+   revocation is stored, the rebuilt channel releases it. */
+int test_end_date_revocation_wait_survives_restart(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    channel_t *lsp_ch = calloc(1, sizeof(channel_t)), *cli_ch = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(kps && f && lsp_ch && cli_ch, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x6F, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+    TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "member database");
+    channel_set_persist(cli_ch, &db, 0);
+    TEST_ASSERT(ep_open_cosigned(ctx, lsp_ch, cli_ch), "commitment 0 co-signed");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    wire_msg_t cs;
+    TEST_ASSERT(ep_update_to_1(lsp_ch, cli_ch, &cs), "update");
+    TEST_ASSERT(client_handle_commitment_signed(sv[1], cli_ch, ctx, &cs), "member 1");
+    cJSON_Delete(cs.json);
+    wire_msg_t ack;
+    TEST_ASSERT(wire_recv(sv[0], &ack), "ack");
+    uint32_t cid;
+    unsigned char sec[32], np[33];
+    TEST_ASSERT(lsp_parse_member_revoke(lsp_ch, ack.json, &cid, sec, np), "host takes 1");
+    cJSON_Delete(ack.json);
+
+    /* restart: the channel is rebuilt; the LSP's commitment 0 is unrevoked */
+    for (int round = 0; round < 2; round++) {
+        if (round == 1) {
+            unsigned char lsp_sec[32];
+            secp256k1_pubkey next;
+            TEST_ASSERT(channel_get_revocation_secret(lsp_ch, 0, lsp_sec) &&
+                        channel_get_per_commitment_point(lsp_ch, 2, &next), "LSP secret");
+            wire_msg_t m;
+            memset(&m, 0, sizeof(m));
+            m.msg_type = MSG_LSP_REVOKE_AND_ACK;
+            m.json = wire_build_revoke_and_ack(0, lsp_sec, ctx, &next);
+            TEST_ASSERT(client_handle_lsp_revoke_and_ack(cli_ch, ctx, &m), "revocation stored");
+            cJSON_Delete(m.json);
+        }
+        channel_t *l2 = calloc(1, sizeof(channel_t)), *re = calloc(1, sizeof(channel_t));
+        TEST_ASSERT(l2 && re && ep_channel_pair(ctx, f, kps, l2, re, cap / 2, cap / 2 - 2000),
+                    "rebuilt channel");
+        re->commitment_number = 1;
+        TEST_ASSERT(client_restore_host_revocations(re, &db, 0), "restore");
+        if (round == 0) {
+            TEST_ASSERT(!client_host_old_commitments_revoked(re),
+                        "after a restart an unrevoked older LSP commitment still blocks the preimage");
+            unsigned char preimage[32];
+            memset(preimage, 0x11, 32);
+            TEST_ASSERT(!client_fulfill_payment(sv[1], re, 0, preimage), "fulfil refused");
+        } else {
+            TEST_ASSERT(client_host_old_commitments_revoked(re),
+                        "the stored revocation is restored: the preimage may go");
+        }
+        channel_cleanup(l2);
+        channel_cleanup(re);
+        free(l2);
+        free(re);
+    }
+    persist_close(&db);
+    close(sv[0]);
+    close(sv[1]);
+    channel_cleanup(lsp_ch);
+    channel_cleanup(cli_ch);
+    free(lsp_ch);
+    free(cli_ch);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* No factory without an end date in the future: the member refuses a
+   proposal with CLTV timeout 0 (with or without a chain view), the builder
+   makes no payouts for it, and the LSP does not start the ceremony. */
+int test_end_date_refuses_missing_end_date(void) {
+    char err[320];
+    TEST_ASSERT(!cli_validate_proposed_cltv(0, 0, 10, err, sizeof(err)),
+                "CLTV 0 refused without a chain view");
+    TEST_ASSERT(!cli_validate_proposed_cltv(0, 500, 10, err, sizeof(err)),
+                "CLTV 0 refused with a chain view");
+    TEST_ASSERT(!cli_validate_proposed_cltv(400, 500, 10, err, sizeof(err)),
+                "a CLTV in the past is refused");
+    TEST_ASSERT(cli_validate_proposed_cltv(600, 500, 10, err, sizeof(err)),
+                "a CLTV past the exit is taken");
+
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x70, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 0) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree without an end date");
+    TEST_ASSERT(f->n_payouts == 0, "no payouts without an end date");
+    factory_free(f);
+    free(f);
+
+    lsp_t *l = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(l, "alloc");
+    TEST_ASSERT(lsp_run_factory_creation(l, txid, 0, 2000000, spk, 34, 10, 4, 0) == 0,
+                "the LSP proposes no factory without an end date");
+    free(l);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The commitment anchor comes from the funder's balance only: a state that
+   leaves the funder too little for it is not built, so it is never signed. */
+int test_end_date_anchor_from_funder_only(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    channel_t *lsp_ch = calloc(1, sizeof(channel_t)), *cli_ch = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(kps && f && lsp_ch && cli_ch, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x71, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+    TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+    tx_buf_t t;
+    tx_buf_init(&t, 512);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(lsp_ch, &t, ct) &&
+                channel_build_commitment_tx(cli_ch, &t, ct), "both commitments built");
+    /* the LSP (funder) keeps 300 sat: below the 240-sat anchor plus dust */
+    uint64_t total = lsp_ch->local_amount + lsp_ch->remote_amount;
+    lsp_ch->local_amount = 300;  lsp_ch->remote_amount = total - 300;
+    cli_ch->remote_amount = 300; cli_ch->local_amount = total - 300;
+    TEST_ASSERT(!channel_build_commitment_tx(lsp_ch, &t, ct),
+                "the LSP's commitment is not built from the member's balance");
+    TEST_ASSERT(!channel_build_commitment_tx(cli_ch, &t, ct),
+                "the member's commitment is not built from the member's balance");
+    unsigned char ps[32];
+    uint32_t ni;
+    TEST_ASSERT(!channel_create_commitment_partial_sig(lsp_ch, ps, &ni),
+                "so no signature for that state");
+    tx_buf_free(&t);
+    channel_cleanup(lsp_ch);
+    channel_cleanup(cli_ch);
+    free(lsp_ch);
+    free(cli_ch);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Between updates the LSP refreshes a channel's signing nonces before they
+   run out (lsp_channels_refresh_nonces, from the daemon loop); the member
+   answers with a fresh pool (client_handle_nonce_refresh), and the next
+   update, with its co-signature of the LSP's commitment, signs from the
+   fresh pools. */
+int test_end_date_nonce_refresh(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    channel_t *cli_ch = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(kps && f && mgr && lsp && cli_ch, "alloc");
+    mgr->entries = calloc(1, sizeof(lsp_channel_entry_t));
+    lsp->client_fds = calloc(1, sizeof(int));
+    TEST_ASSERT(mgr->entries && lsp->client_fds, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x72, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+    channel_t *lsp_ch = &mgr->entries[0].channel;
+    TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+    mgr->ctx = ctx;
+    mgr->n_channels = 1;
+    mgr->entries[0].ready = 1;
+    TEST_ASSERT(ep_open_cosigned(ctx, lsp_ch, cli_ch), "commitment 0 co-signed");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp->client_fds[0] = sv[0];
+
+    /* nearly spent on both sides */
+    lsp_ch->remote_nonce_next = lsp_ch->remote_nonce_count - 1;
+    cli_ch->remote_nonce_next = cli_ch->remote_nonce_count - 1;
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        close(sv[0]);
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        int ok = wire_recv_timeout(sv[1], &m, 10) && m.msg_type == MSG_CHANNEL_NONCES &&
+                 cJSON_IsTrue(cJSON_GetObjectItem(m.json, "refresh")) &&
+                 client_handle_nonce_refresh(sv[1], cli_ch, ctx, &m);
+        if (m.json) cJSON_Delete(m.json);
+        /* then the next update, signed from the fresh pools */
+        memset(&m, 0, sizeof(m));
+        ok = ok && wire_recv_timeout(sv[1], &m, 10) && m.msg_type == MSG_COMMITMENT_SIGNED;
+        if (ok) {
+            cli_ch->commitment_number = 1;
+            channel_generate_local_pcs(cli_ch, 2);
+            cli_ch->local_amount += 5000;  cli_ch->remote_amount -= 5000;
+            ok = client_handle_commitment_signed(sv[1], cli_ch, ctx, &m);
+        }
+        if (m.json) cJSON_Delete(m.json);
+        _exit(ok ? 0 : 1);
+    }
+    close(sv[1]);
+    TEST_ASSERT(lsp_channels_refresh_nonces(mgr, lsp, 0, 0) == 1, "nonces refreshed");
+    TEST_ASSERT(lsp_ch->remote_nonce_next == 0 &&
+                lsp_ch->remote_nonce_count >= CHANNEL_NONCE_REFRESH_AT, "fresh member nonces");
+    wire_msg_t cs;
+    TEST_ASSERT(ep_update_to_1(lsp_ch, cli_ch, &cs), "LSP signs commitment 1 with fresh nonces");
+    TEST_ASSERT(wire_send(sv[0], MSG_COMMITMENT_SIGNED, cs.json), "send");
+    cJSON_Delete(cs.json);
+    wire_msg_t ack;
+    memset(&ack, 0, sizeof(ack));
+    TEST_ASSERT(wire_recv_timeout(sv[0], &ack, 10) && ack.msg_type == MSG_REVOKE_AND_ACK, "ack");
+    uint32_t cid;
+    unsigned char sec[32], np[33];
+    TEST_ASSERT(lsp_parse_member_revoke(lsp_ch, ack.json, &cid, sec, np),
+                "the member's co-signature of the LSP's commitment 1 verifies");
+    cJSON_Delete(ack.json);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    TEST_ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 0, "member side");
+    close(sv[0]);
+    channel_cleanup(lsp_ch);
+    channel_cleanup(cli_ch);
+    free(cli_ch);
+    free(mgr->entries);
+    free(mgr);
+    free(lsp->client_fds);
+    free(lsp);
     factory_free(f);
     free(f);
     free(kps);

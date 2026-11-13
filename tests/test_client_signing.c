@@ -2001,7 +2001,8 @@ static int cs_run_inprocess_creation(int *creation_rc_out, int *dist_signed_out)
 /* The LSP test hooks SS_CHEAT_DIST_OMIT and SS_CHEAT_DIST_LOCKTIME have no
    effect unless cheats are allowed: with the env var set and the cheat gate
    off, factory creation completes with a signed distribution TX.  With the
-   gate on the hook fires and no signed distribution TX comes out of it. */
+   gate on the hook fires: the distribution TX is not co-signed by every
+   member, and no factory is created without it. */
 static int test_lsp_dist_cheats_need_cheat_gate_body(void) {
     static const char *const hooks[] = { "SS_CHEAT_DIST_OMIT",
                                          "SS_CHEAT_DIST_LOCKTIME" };
@@ -2017,8 +2018,7 @@ static int test_lsp_dist_cheats_need_cheat_gate_body(void) {
         superscalar_set_cheat_gate(1);
         TEST_ASSERT(cs_run_inprocess_creation(&rc, &dist_signed), "setup (gate on)");
         superscalar_set_cheat_gate(0);
-        TEST_ASSERT(rc == 0 || !dist_signed,
-                    "gate on: the hook fires, no signed distribution TX");
+        TEST_ASSERT(rc == 0, "gate on: no factory without a co-signed distribution TX");
 
         unsetenv(hooks[h]);
     }

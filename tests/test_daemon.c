@@ -185,6 +185,17 @@ int test_client_daemon_autofulfill(void) {
         }
         cJSON_Delete(m.json);
 
+        /* The LSP's revocation of its commitment 0, which arrives after the
+           update and before the member releases a preimage. */
+        {
+            unsigned char lsp_prev[32];
+            secp256k1_pubkey lsp_pt;
+            memset(lsp_prev, 0x33, 32);
+            if (!secp256k1_ec_pubkey_create(ctx, &lsp_pt, lsp_prev)) _exit(5);
+            channel_set_remote_pcp(&ch, 0, &lsp_pt);
+            if (!channel_receive_revocation(&ch, 0, lsp_prev)) _exit(6);
+        }
+
         /* Find active received HTLC and fulfill it */
         int found = 0;
         for (size_t h = 0; h < ch.n_htlcs; h++) {

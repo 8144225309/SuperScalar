@@ -262,7 +262,7 @@ static void usage(const char *prog) {
         "                       (uniform); a comma list sets the arity per level (root..\n"
         "                       leaves, each 1-15).  See docs/factory-arity.md.\n"
         "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
-        "                       no DW counter, only CLTV timeout escape). Range 0..7\n"
+        "                       no DW counter). Range 0..7\n"
         "                       (FACTORY_MAX_LEVELS-1).  With --arity and no\n"
         "                       --static-near-root the shape keeps DW state on every level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
@@ -4298,7 +4298,11 @@ accept_new_factory:
             created_for_check = cltv_planned_created;
         }
         char cltv_err[512];
-        if (created_for_check > 0 &&
+        if (created_for_check == 0)
+            snprintf(cltv_err, sizeof(cltv_err), "Error: the chain height is not known, "
+                     "so the factory CLTV timeout %u cannot be checked against the "
+                     "factory's lifetime and exit", (unsigned)cltv_timeout);
+        if (created_for_check == 0 ||
             !cli_validate_factory_cltv(cltv_timeout, created_for_check,
                                        active_blocks, dying_blocks, factory_exit_blocks,
                                        cltv_err, sizeof(cltv_err))) {

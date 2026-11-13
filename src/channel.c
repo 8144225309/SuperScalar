@@ -431,7 +431,7 @@ static int channel_ensure_pcs_cap(channel_t *ch, size_t needed) {
     return 1;
 }
 
-static int channel_ensure_revocations_cap(channel_t *ch, size_t needed) {
+int channel_ensure_revocations_cap(channel_t *ch, size_t needed) {
     if (needed <= ch->revocations_cap) return 1;
     size_t new_cap = ch->revocations_cap ? ch->revocations_cap * 2 : 512;
     while (new_cap < needed) new_cap *= 2;
@@ -930,7 +930,6 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
        240 sat, above dust). */
     if (ch->use_cpfp_anchor) {
         uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
-        int placed = 0;
         /* The funder's output funds it, whichever side's commitment this is:
            the member's commitment takes it from the LSP's to_remote as
            before, and the LSP's own commitment (which the member co-signs so
@@ -938,26 +937,21 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
            the member's balance.  channel_build_commitment_tx_for_remote
            flips funder_is_local with the view, so both builders agree. */
         size_t fo = ch->funder_is_local ? 0 : 1;
-        if (outputs[fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
-            outputs[fo].amount_sats -= anchor; placed = 1;
-        } else if (outputs[1 - fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
-            outputs[1 - fo].amount_sats -= anchor; placed = 1;   /* fallback */
-        }
-        if (placed) {
-            memcpy(outputs[out_idx].script_pubkey, P2A_SPK, P2A_SPK_LEN);
-            outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
-            outputs[out_idx].amount_sats = anchor;
-            out_idx++;
-        } else if (ch->commit_fee_rate_sat_per_kvb == 0) {
-            /* Neither balance can fund the anchor and the commitment pays no
-               fee: nothing could ever get it mined.  Such a state is never
-               built, so it is never signed. */
-            fprintf(stderr, "channel commitment: balances %llu/%llu cannot fund "
-                    "the anchor of a commitment at rate 0; refusing to build it\n",
-                    (unsigned long long)outputs[0].amount_sats,
-                    (unsigned long long)outputs[1].amount_sats);
+        if (outputs[fo].amount_sats <= anchor + CHANNEL_DUST_LIMIT_SATS) {
+            /* The funder's balance cannot fund the anchor.  It is never taken
+               from the other side: a state that leaves the funder that little
+               is not built, so it is never signed and the update that would
+               reach it fails. */
+            fprintf(stderr, "channel commitment: the funder's balance %llu cannot fund "
+                    "the commitment anchor; refusing to build it\n",
+                    (unsigned long long)outputs[fo].amount_sats);
             goto commit_tx_done;
         }
+        outputs[fo].amount_sats -= anchor;
+        memcpy(outputs[out_idx].script_pubkey, P2A_SPK, P2A_SPK_LEN);
+        outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
+        outputs[out_idx].amount_sats = anchor;
+        out_idx++;
     }
 
     /* 8. Build unsigned tx (nVersion=3/TRUC: enables V3 penalty + CPFP chain) */
@@ -1533,6 +1527,13 @@ int channel_create_commitment_partial_sig(
     unsigned char *partial_sig32_out,
     uint32_t *nonce_index_out)
 {
+    /* A channel whose member did not co-sign the LSP's commitment takes no
+       further update (lsp_take_host_commit_sig). */
+    if (ch->host_commit_refused) {
+        fprintf(stderr, "channel: no update on a channel without a co-signed LSP "
+                "commitment\n");
+        return 0;
+    }
     /* 1. Determine nonce index = remote_nonce_next (consumed in order) */
     uint32_t nidx = (uint32_t)ch->remote_nonce_next;
     if (nidx >= ch->remote_nonce_count) return 0;

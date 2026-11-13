@@ -928,9 +928,8 @@ size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp)
    committed to and was stored.  Otherwise nothing is stored, the error is
    logged and the client's connection is dropped: the caller must not go on
    with the exchange (no watchtower entry, no revocation of its own). */
-/* The LSP's own latest commitment of ch, fully signed with the member's
-   co-signature (lsp_take_host_commit_sig) at ch's current number; 0 when it
-   holds none for that number. */
+/* The LSP's own latest commitment of ch that the member co-signed, fully
+   signed (lsp_take_host_commit_sig); 0 when it holds none. */
 int lsp_signed_host_commitment(const channel_t *ch, tx_buf_t *out,
                                char txid_hex_out[65]);
 
@@ -943,8 +942,17 @@ int lsp_signed_host_commitment(const channel_t *ch, tx_buf_t *out,
 int lsp_force_exit_step(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
                         chain_backend_t *chain);
 
+/* Below this many signing nonces left on a channel (either side) the LSP
+   runs a fresh nonce exchange between updates (MSG_CHANNEL_NONCES with
+   "refresh"); every update uses two of each side's nonces. */
+#define CHANNEL_NONCE_REFRESH_AT 32
+/* Refresh channel c's nonces when below CHANNEL_NONCE_REFRESH_AT (or always,
+   with force).  Returns 1 if the channel has enough afterwards. */
+int lsp_channels_refresh_nonces(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c, int force);
+
 /* Take the member's signature over the LSP's own commitment from json
-   (REVOKE_AND_ACK or HOST_COMMITMENT_SIG); 0 only if it does not verify. */
+   (REVOKE_AND_ACK or HOST_COMMITMENT_SIG): 0 when it is missing or does not
+   verify, which refuses the update and marks the channel refused. */
 int lsp_take_host_commit_sig(channel_t *ch, const cJSON *json);
 /* wire_parse_revoke_and_ack plus lsp_take_host_commit_sig for ch. */
 int lsp_parse_member_revoke(channel_t *ch, const cJSON *json, uint32_t *channel_id,

@@ -60,6 +60,20 @@ uint32_t client_chain_tip(void) {
            ? g_client_chain_tip_fn(g_client_chain_tip_ctx) : 0;
 }
 
+/* The proposed end date must be past this member's exit from the proposed
+   tree, judged by the member's own chain tip.  A member with a chain view
+   that cannot read its tip refuses: the end date cannot be checked. */
+static int client_check_proposed_cltv(uint32_t cltv_timeout, uint32_t exit_blocks,
+                                      char *err, size_t err_len) {
+    uint32_t tip = client_chain_tip();
+    if (g_client_chain_tip_fn && tip == 0) {
+        snprintf(err, err_len, "the chain tip is not known, so the factory CLTV "
+                 "timeout %u cannot be checked", (unsigned)cltv_timeout);
+        return 0;
+    }
+    return cli_validate_proposed_cltv(cltv_timeout, tip, exit_blocks, err, err_len);
+}
+
 static unsigned g_client_chain_tip_attempts = CLIENT_CHAIN_TIP_ATTEMPTS;
 static unsigned g_client_chain_tip_retry_ms = CLIENT_CHAIN_TIP_RETRY_MS;
 
@@ -585,24 +599,36 @@ int client_add_host_commit_sig(channel_t *ch, cJSON *msg) {
     }
     wire_json_add_hex(msg, "host_commit_psig", psig, 32);
     cJSON_AddNumberToObject(msg, "host_commit_nonce_index", (double)nidx);
-    if (ch->host_cosigned_hi == ch->host_cosigned_lo)
-        ch->host_cosigned_lo = ch->commitment_number;
-    if (ch->commitment_number + 1 > ch->host_cosigned_hi)
-        ch->host_cosigned_hi = ch->commitment_number + 1;
     return 1;
 }
 
-/* 1 if every LSP commitment this member co-signed below its current one is
-   revoked (the LSP's revocation secret received and verified).  An LSP that
-   kept an unrevoked older commitment could publish it after this member
-   released a preimage. */
+/* 1 if every LSP commitment below the member's current one is revoked (the
+   LSP's revocation secret received and verified).  The member co-signs the
+   LSP's commitment at every number, from the channel open on, so each one
+   below the current number must be revoked: an LSP holding an unrevoked
+   older commitment could publish it after this member released a preimage.
+   The secrets are on disk (revocation_secrets) and restored with the channel
+   (client_restore_host_revocations), so the rule holds across a restart or
+   a reconnect. */
 int client_host_old_commitments_revoked(const channel_t *ch) {
     if (!ch) return 1;
     unsigned char s[32];
-    for (uint64_t cn = ch->host_cosigned_lo;
-         cn < ch->host_cosigned_hi && cn < ch->commitment_number; cn++) {
+    for (uint64_t cn = 0; cn < ch->commitment_number; cn++) {
         if (!channel_get_received_revocation(ch, cn, s)) return 0;
     }
+    return 1;
+}
+
+int client_restore_host_revocations(channel_t *ch, persist_t *db, uint32_t channel_id) {
+    if (!ch || !db) return 0;
+    /* revocations received from here on are stored too */
+    channel_set_persist(ch, db, channel_id);
+    if (!channel_ensure_revocations_cap(ch, (size_t)ch->commitment_number + 1)) return 0;
+    size_t n = 0;
+    if (!persist_load_revocations_flat(db, channel_id, ch->received_revocations,
+                                       ch->received_revocation_valid,
+                                       ch->revocations_cap, &n))
+        return 0;
     return 1;
 }
 
@@ -652,13 +678,51 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp);
 
     cJSON *ack = wire_build_revoke_and_ack(channel_id, rev_secret, ctx, &next_pcp);
-    client_add_host_commit_sig(ch, ack);
+    /* The revocation goes only with this member's signature over the LSP's
+       commitment at the same number: without it the update fails here, and
+       the member's previous commitment stays unrevoked. */
+    if (!client_add_host_commit_sig(ch, ack)) {
+        cJSON_Delete(ack);
+        memset(rev_secret, 0, 32);
+        fprintf(stderr, "Client: failing the update to commitment %llu: no signature "
+                "over the LSP's commitment, so no revocation is sent\n",
+                (unsigned long long)ch->commitment_number);
+        client_send_error(fd, "update failed: cannot co-sign the LSP commitment");
+        return 0;
+    }
     int ok = wire_send(fd, MSG_REVOKE_AND_ACK, ack);
     cJSON_Delete(ack);
     memset(rev_secret, 0, 32);
     if (!ok)
         fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
                 (unsigned long long)ch->commitment_number);
+    return ok;
+}
+
+int client_handle_nonce_refresh(int fd, channel_t *ch, secp256k1_context *ctx,
+                                const wire_msg_t *msg) {
+    if (!ch || !ctx || !msg || !msg->json) return 0;
+    unsigned char (*lsp_nonces)[66] = calloc(MUSIG_NONCE_POOL_MAX, 66);
+    if (!lsp_nonces) return 0;
+    uint32_t cid = 0;
+    size_t n = 0;
+    int ok = wire_parse_channel_nonces(msg->json, &cid, lsp_nonces, MUSIG_NONCE_POOL_MAX, &n) &&
+             n > 0 && channel_init_nonce_pool(ch, n);
+    if (ok) {
+        size_t mine = ch->local_nonce_pool.count;
+        unsigned char (*pn)[66] = calloc(mine ? mine : 1, 66);
+        ok = pn != NULL;
+        for (size_t i = 0; ok && i < mine; i++)
+            musig_pubnonce_serialize(ctx, pn[i], &ch->local_nonce_pool.nonces[i].pubnonce);
+        cJSON *reply = ok ? wire_build_channel_nonces(cid, (const unsigned char (*)[66])pn, mine)
+                          : NULL;
+        free(pn);
+        ok = reply && wire_send(fd, MSG_CHANNEL_NONCES, reply);
+        cJSON_Delete(reply);
+        if (ok) channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])lsp_nonces, n);
+    }
+    free(lsp_nonces);
+    if (!ok) fprintf(stderr, "Client: nonce refresh failed\n");
     return ok;
 }
 
@@ -1085,8 +1149,13 @@ int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
     cJSON *reply = cJSON_CreateObject();
     cJSON_AddNumberToObject(reply, "channel_id", 0);
     cJSON_AddNumberToObject(reply, "commitment_number", 0);
-    ok = reply && client_add_host_commit_sig(ch, reply) &&
-         wire_send(fd, MSG_HOST_COMMITMENT_SIG, reply);
+    /* Test hook, inert unless cheats are allowed (regtest only): send the
+       message without the co-signature. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_NO_HOST_COMMIT_SIG"))
+        ok = reply && wire_send(fd, MSG_HOST_COMMITMENT_SIG, reply);
+    else
+        ok = reply && client_add_host_commit_sig(ch, reply) &&
+             wire_send(fd, MSG_HOST_COMMITMENT_SIG, reply);
     cJSON_Delete(reply);
     if (!ok)
         fprintf(stderr, "Client %u: could not send the LSP its signed commitment 0\n",
@@ -2262,7 +2331,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
             rot_n_level_arity > 0 ? rot_level_arities : NULL, rot_n_level_arity,
             (factory_arity_t)rot_leaf_arity, 1, n_participants - 1,
             rot_static_threshold, step_blocks, states_per_layer);
-        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+        if (!client_check_proposed_cltv(cltv_timeout, exit_blocks,
                                         cltv_err, sizeof(cltv_err))) {
             fprintf(stderr, "Client %u: REFUSING rotation: %s\n", my_index, cltv_err);
             return 0;
@@ -3486,7 +3555,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             (factory_arity_t)leaf_arity,
             ps_subfactory_arity_in > 1 ? ps_subfactory_arity_in : 1, n_participants - 1,
             static_threshold_depth, step_blocks, states_per_layer);
-        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+        if (!client_check_proposed_cltv(cltv_timeout, exit_blocks,
                                         cltv_err, sizeof(cltv_err))) {
             fprintf(stderr, "Client: REFUSING factory: %s\n", cltv_err);
             client_send_error(fd, "factory CLTV timeout is not safely in the future");
