@@ -6623,3 +6623,181 @@ int test_client_handles_update_fail_htlc(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+
+/* --- A member that is not connected: the LSP holds its payment --- */
+
+typedef struct {
+    secp256k1_context *ctx;
+    lsp_channel_mgr_t mgr;
+    lsp_t *lsp;
+    persist_t db;
+    int fds[2];
+    int sv[2];          /* sv[0] the LSP's bridge fd, sv[1] the bridge */
+    unsigned char hash[32];
+    unsigned char onion[ONION_WIRE_SIZE];
+} held_fixture_t;
+
+static int held_fixture_init(held_fixture_t *f) {
+    memset(f, 0, sizeof(*f));
+    f->ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                      SECP256K1_CONTEXT_VERIFY);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, f->sv) != 0) return 0;
+    if (!persist_open(&f->db, NULL)) return 0;
+    lsp_channel_mgr_t *m = &f->mgr;
+    m->ctx = f->ctx;
+    m->n_channels = 2;
+    m->bridge_fd = f->sv[0];
+    m->persist = &f->db;
+    m->entries = calloc(2, sizeof(lsp_channel_entry_t));
+    m->entries_cap = 2;
+    m->invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    m->invoices_cap = MAX_INVOICE_REGISTRY;
+    m->htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    m->htlc_origins_cap = MAX_HTLC_ORIGINS;
+    f->lsp = calloc(1, sizeof(lsp_t));
+    if (!m->entries || !m->invoices || !m->htlc_origins || !f->lsp) return 0;
+    for (int i = 0; i < 2; i++) {
+        m->entries[i].channel.local_amount = 100000;
+        m->entries[i].channel.remote_amount = 100000;
+        m->entries[i].ready = 1;
+    }
+    f->fds[0] = f->fds[1] = -1;           /* nobody connected */
+    f->lsp->client_fds = f->fds;
+    memset(f->hash, 0x6d, 32);
+    for (size_t i = 0; i < sizeof(f->onion); i++)
+        f->onion[i] = (unsigned char)(i * 11 + 1);
+    return lsp_channels_register_invoice(m, f->hash, 1, 5000000);
+}
+
+static void held_fixture_free(held_fixture_t *f) {
+    for (size_t i = 0; i < f->mgr.n_channels; i++)
+        channel_cleanup(&f->mgr.entries[i].channel);
+    close(f->sv[0]);
+    close(f->sv[1]);
+    persist_close(&f->db);
+    free(f->lsp);
+    free(f->mgr.entries);
+    free(f->mgr.invoices);
+    free(f->mgr.htlc_origins);
+    secp256k1_context_destroy(f->ctx);
+}
+
+static int bridge_offers(held_fixture_t *f, uint32_t cltv, uint64_t id) {
+    cJSON *add = wire_build_bridge_add_htlc(f->hash, 5000000, cltv, id);
+    wire_set_onion(add, f->onion);
+    wire_msg_t m;
+    m.msg_type = MSG_BRIDGE_ADD_HTLC;
+    m.json = add;
+    int ok = lsp_channels_handle_bridge_msg(&f->mgr, f->lsp, &m);
+    cJSON_Delete(add);
+    return ok;
+}
+
+static htlc_origin_t *held_origin(lsp_channel_mgr_t *m) {
+    for (size_t i = 0; i < m->n_htlc_origins; i++)
+        if (m->htlc_origins[i].active && m->htlc_origins[i].held)
+            return &m->htlc_origins[i];
+    return NULL;
+}
+
+/* A payment for a member that is not connected is held, not failed and not
+   settled; it survives an LSP restart; and it is failed back to the
+   Lightning node a safety margin before it expires. */
+int test_bridge_member_offline_htlc_held(void) {
+    held_fixture_t f;
+    TEST_ASSERT(held_fixture_init(&f), "fixture");
+    const uint32_t cltv = 600;
+    TEST_ASSERT(bridge_offers(&f, cltv, 9), "handled");
+
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    TEST_ASSERT(!wire_recv_timeout(f.sv[1], &r, 1),
+                "nothing goes back to the Lightning node: the HTLC is held");
+    htlc_origin_t *o = held_origin(&f.mgr);
+    TEST_ASSERT(o && o->sender_idx == 1 && o->amount_msat == 5000000 &&
+                o->has_onion && memcmp(o->onion, f.onion, sizeof(f.onion)) == 0,
+                "held for client 1 with its onion");
+    TEST_ASSERT_EQ(f.mgr.entries[1].channel.n_htlcs, 0, "nothing in the channel");
+
+    /* An LSP restart finds it again */
+    {
+        lsp_channel_mgr_t m2;
+        memset(&m2, 0, sizeof(m2));
+        m2.persist = &f.db;
+        m2.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+        m2.htlc_origins_cap = MAX_HTLC_ORIGINS;
+        TEST_ASSERT(lsp_channels_restore_origins(&m2) == 1, "restored");
+        htlc_origin_t *o2 = held_origin(&m2);
+        TEST_ASSERT(o2 && o2->amount_msat == 5000000 && o2->has_onion &&
+                    memcmp(o2->onion, f.onion, sizeof(f.onion)) == 0,
+                    "still held after a restart");
+        free(m2.htlc_origins);
+    }
+
+    /* Held up to the margin before its expiry, then failed back */
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp,
+                                            cltv - FACTORY_CLTV_DELTA_DEFAULT - 1);
+    TEST_ASSERT(!wire_recv_timeout(f.sv[1], &r, 1), "still held");
+    TEST_ASSERT(held_origin(&f.mgr) != NULL, "still held");
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp,
+                                            cltv - FACTORY_CLTV_DELTA_DEFAULT);
+    TEST_ASSERT(wire_recv_timeout(f.sv[1], &r, 5), "the node is answered");
+    unsigned char rh[32];
+    char reason[64];
+    uint64_t rid = 0;
+    TEST_ASSERT(r.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+                wire_parse_bridge_fail_htlc(r.json, rh, reason, sizeof(reason), &rid) &&
+                rid == 9 && memcmp(rh, f.hash, 32) == 0,
+                "failed back, never settled");
+    cJSON_Delete(r.json);
+    TEST_ASSERT(held_origin(&f.mgr) == NULL, "no longer held");
+    uint64_t am;
+    int has;
+    unsigned char on[ONION_WIRE_SIZE];
+    TEST_ASSERT(!persist_load_held_inbound(&f.db, f.mgr.htlc_origins[0].db_id,
+                                           &am, on, sizeof(on), &has),
+                "and gone from the database");
+    held_fixture_free(&f);
+    return 1;
+}
+
+/* When the member reconnects, the held HTLC is offered to it with the
+   payer's onion; the LSP still has nothing to settle it with. */
+int test_bridge_held_htlc_offered_on_reconnect(void) {
+    held_fixture_t f;
+    TEST_ASSERT(held_fixture_init(&f), "fixture");
+    TEST_ASSERT(bridge_offers(&f, 600, 11), "handled");
+    TEST_ASSERT(held_origin(&f.mgr) != NULL, "held");
+
+    int cl[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    f.fds[1] = cl[0];                       /* client 1 is back */
+    TEST_ASSERT(lsp_channels_replay_held_inbound(&f.mgr, f.lsp, 1) == 1,
+                "the held HTLC is offered");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(cl[1], &m, 5) &&
+                m.msg_type == MSG_UPDATE_ADD_HTLC, "client gets UPDATE_ADD_HTLC");
+    unsigned char got[ONION_WIRE_SIZE], ph[32];
+    uint64_t hid, amt;
+    uint32_t cltv;
+    TEST_ASSERT(wire_parse_update_add_htlc(m.json, &hid, &amt, ph, &cltv) &&
+                amt == 5000000 && cltv == 600 && memcmp(ph, f.hash, 32) == 0,
+                "for the held payment");
+    TEST_ASSERT(wire_get_onion(m.json, got) == 1 &&
+                memcmp(got, f.onion, sizeof(got)) == 0, "with its onion");
+    cJSON_Delete(m.json);
+    TEST_ASSERT(held_origin(&f.mgr) == NULL, "no longer held");
+
+    /* Whatever the bridge hears now, it is never a fulfil from the LSP */
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    if (wire_recv_timeout(f.sv[1], &r, 1)) {
+        TEST_ASSERT(r.msg_type != MSG_BRIDGE_FULFILL_HTLC, "no fulfil by the LSP");
+        cJSON_Delete(r.json);
+    }
+    close(cl[0]);
+    close(cl[1]);
+    held_fixture_free(&f);
+    return 1;
+}

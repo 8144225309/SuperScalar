@@ -304,6 +304,11 @@ static const char *SCHEMA_SQL =
     "  upstream_id TEXT NOT NULL DEFAULT '',"
     "  fail_pending INTEGER DEFAULT 0"
     ");"
+    "CREATE TABLE IF NOT EXISTS held_inbound ("
+    "  origin_id INTEGER PRIMARY KEY,"
+    "  amount_msat INTEGER NOT NULL,"
+    "  onion TEXT"
+    ");"
     "CREATE TABLE IF NOT EXISTS client_invoices ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payment_hash TEXT NOT NULL,"
@@ -5997,6 +6002,70 @@ int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
         }
         if (fail_pending_out)
             *fail_pending_out = sqlite3_column_int(stmt, 2);
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+int persist_save_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t amount_msat,
+                              const unsigned char *onion, size_t onion_len) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO held_inbound (origin_id, amount_msat, onion) "
+        "VALUES (?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)amount_msat);
+    char *hex = NULL;
+    if (onion && onion_len) {
+        hex = malloc(onion_len * 2 + 1);
+        if (!hex) { sqlite3_finalize(stmt); return 0; }
+        hex_encode(onion, onion_len, hex);
+        sqlite3_bind_text(stmt, 3, hex, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 3);
+    }
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(hex);
+    return ok;
+}
+
+int persist_delete_held_inbound(persist_t *p, int64_t row_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql = "DELETE FROM held_inbound WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t *amount_msat_out,
+                              unsigned char *onion_out, size_t onion_cap,
+                              int *has_onion_out) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "SELECT amount_msat, onion FROM held_inbound WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        if (amount_msat_out)
+            *amount_msat_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
+        int has = hex && onion_out && strlen(hex) == onion_cap * 2 &&
+                  hex_decode(hex, onion_out, onion_cap) == (int)onion_cap;
+        if (has_onion_out) *has_onion_out = has;
     }
     sqlite3_finalize(stmt);
     return found;

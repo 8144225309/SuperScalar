@@ -6954,6 +6954,9 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
     if (lsp->client_fds[c] < 0) return 0;   /* a replay failed: the client reconnects again */
+    /* ...and the inbound HTLCs held for it while it was away */
+    lsp_channels_replay_held_inbound(mgr, lsp, c);
+    if (lsp->client_fds[c] < 0) return 0;
 
     if (mgr->readiness)
         readiness_set_connected((readiness_tracker_t *)mgr->readiness,

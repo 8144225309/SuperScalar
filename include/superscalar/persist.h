@@ -881,6 +881,19 @@ int persist_update_htlc_origin(persist_t *p, int64_t row_id,
                                 uint64_t bridge_htlc_id, uint64_t request_id,
                                 size_t sender_idx, uint64_t sender_htlc_id);
 int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id);
+
+/* An inbound HTLC held for a client that is not connected (origin row
+   row_id): its amount and the payer's onion for the client (NULL: none). */
+int persist_save_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t amount_msat,
+                              const unsigned char *onion, size_t onion_len);
+int persist_delete_held_inbound(persist_t *p, int64_t row_id);
+/* 1 if row_id is held; then *amount_msat_out and, if one was kept, the
+   onion (onion_cap bytes) with *has_onion_out = 1. */
+int persist_load_held_inbound(persist_t *p, int64_t row_id,
+                              uint64_t *amount_msat_out,
+                              unsigned char *onion_out, size_t onion_cap,
+                              int *has_onion_out);
 /* What else has to survive a restart for the origin in row `row_id`: the
    HTLC's expiry, its name on the Lightning node, and whether its failure
    still has to be reported to the bridge. */

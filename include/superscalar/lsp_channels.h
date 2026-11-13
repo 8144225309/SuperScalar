@@ -152,6 +152,14 @@ typedef struct {
                                    the origin) */
     int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
+    /* inbound: the client was not connected when the HTLC came in.  It is
+       held here (with what is needed to offer it: the amount and the
+       payer's onion for the client), offered when the client reconnects,
+       or failed back before it expires.  The LSP never settles it. */
+    int held;
+    uint64_t amount_msat;
+    int has_onion;
+    unsigned char onion[ONION_WIRE_SIZE];
 } htlc_origin_t;
 
 /* Reorg detection (R1).  See lsp_reorg_poll() below. */
@@ -876,6 +884,11 @@ uint32_t lsp_channels_chain_height(const lsp_channel_mgr_t *mgr);
    static reason string. */
 int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
                                uint64_t *request_id_out, const char **err_out);
+
+/* Offer the inbound HTLCs held for client_idx while it was away (it has
+   just reconnected).  Returns how many were offered. */
+size_t lsp_channels_replay_held_inbound(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        size_t client_idx);
 
 /* Register a member invoice (payment_hash → dest_client) for inbound
    routing.  The LSP holds no preimage for it. */

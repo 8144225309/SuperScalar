@@ -1895,6 +1895,8 @@ extern int test_tor_password_file(void);
 
 /* Keysend (Signet/Testnet4 Gap) */
 extern int test_bridge_keysend_inbound(void);
+extern int test_bridge_member_offline_htlc_held(void);
+extern int test_bridge_held_htlc_offered_on_reconnect(void);
 
 /* Signet/Testnet4 Gap Stress Tests */
 extern int test_prop_keysend_preimage_verify(void);
@@ -3452,6 +3454,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
     RUN_TEST(test_bridge_keysend_inbound);
+    RUN_TEST(test_bridge_member_offline_htlc_held);
+    RUN_TEST(test_bridge_held_htlc_offered_on_reconnect);
     RUN_TEST(test_bridge_outbound_budget);
     RUN_TEST(test_bridge_outbound_invoice_check);
     RUN_TEST(test_bridge_pay_request_carries_limits);
