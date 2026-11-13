@@ -180,6 +180,11 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - A `PROPOSE_INTENT` whose `n_inputs` is not the chain tx's input count, or whose `subfactory_id` is not the sub-factory that `(leaf_side, sub_idx)` names, is refused before any local change. The single-input sub-factory ceremony, which signed, with no record, a message that is not the sighash of any input of the chain tx, is removed.
 - New client crash checkpoints `ps_sub_record_pre_save`, `ps_sub_record_post_save`, `ps_sub_record_post_final`. Tests in `tests/test_ps_subfactory_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Sub-factory chain advances: per-input record".
 
+### Reconnect after a half-finished forward
+
+- **The LSP replays a pending forward to a reconnecting member in msat.**  The replayed `UPDATE_ADD_HTLC` carried the amount in sat in the msat field, so the member read 1500 sat as 1 sat, refused the HTLC and its commitment, and the channel stayed a commitment ahead of the member: every later payment to or from it failed.
+- **A replay that does not complete is undone.**  The destination channel goes back to the persisted state (amounts, HTLCs, commitment number), the replayed HTLC row is removed and the connection is dropped, so the member's next reconnect replays the forward again from a consistent point.  Before, the channel was left a commitment ahead with an HTLC the member never took.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
