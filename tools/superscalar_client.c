@@ -890,8 +890,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
             /* Factory, channel, basepoints, tree, local secrets and the
-               LSP's first points; also attaches the DB to the channel. */
-            if (client_persist_initial_state(cbd->db, factory, ch, ctx)) {
+               LSP's first points; also attaches the DB to the channel.  The
+               exit-path state (full signed tree + PS chain[0]) is written too,
+               so a client that force-closes before any advance can publish it. */
+            if (client_persist_initial_state(cbd->db, factory, ch, ctx) &&
+                client_persist_exit_state(cbd->db, factory)) {
                 /* #313 self-custody: persist the INITIAL commitment here too, so a
                    funded-but-never-transacted channel stays force-closeable when the
                    LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
@@ -1957,7 +1960,8 @@ handle_message:
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
                         persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
-                        persist_save_tree_nodes(cbd->db, factory, 0)) {
+                        persist_save_tree_nodes(cbd->db, factory, 0) &&
+                        client_persist_exit_state(cbd->db, factory)) {
                         /* Save signed distribution TX if available */
                         if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
                             persist_save_distribution_tx(cbd->db, 0,
@@ -2029,8 +2033,11 @@ handle_message:
                        my_index, leaf_side);
                 /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
                    recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
+                   The factory already holds the advanced tx from the PROPOSE ceremony.
+                   Exit-path persistence: signed nodes only (a stored signature is
+                   never wiped) plus the PS chain entry, so the self-exit can
+                   publish chain[0..N]. */
+                if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory))
                     fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
                             "leaf advance failed\n", my_index);
             }
@@ -2045,6 +2052,9 @@ handle_message:
             if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "realloc failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2060,6 +2070,9 @@ handle_message:
             if (!client_handle_state_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: state advance failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "state advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2076,6 +2089,9 @@ handle_message:
             if (!client_handle_subfactory_advance(fd, ctx, keypair, factory,
                                                     my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: sub-factory advance failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "sub-factory advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2339,9 +2355,12 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
+    char fr_status[512] = {0};
     int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
     fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    if (!result)
+        fprintf(stderr, "Client: CLOSE policy force-close FAILED to publish part of "
+                "the exit path; re-run --force-close and check the status above\n");
     /* Broadcast the signed commitment TX (last verified state) if present. */
     unsigned char signed_tx_data[4096];
     size_t signed_tx_len = 0;
@@ -2810,9 +2829,15 @@ int main(int argc, char *argv[]) {
            passive startup/reorg scan that never broadcasts. Call repeatedly (caller
            mines between passes) so each tree level matures its CSV; the root spends
            the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+        char fr_status[512] = {0};
+        factory_recovery_result_t fr_res;
+        memset(&fr_res, 0, sizeof(fr_res));
+        int result = factory_recovery_run_ex(&db, &chain, 0, 0, &fr_res,
+                                             fr_status, sizeof(fr_status));
         printf("Force-close: %s (run=%d)\n", fr_status, result);
+        if (!result)
+            fprintf(stderr, "Force-close: FAILED to publish part of the factory "
+                    "tree: %s\n", fr_status);
 
         /* Broadcast signed commitment TX if available */
         {
@@ -2869,7 +2894,20 @@ int main(int argc, char *argv[]) {
         }
 
         persist_close(&db);
-        printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+        if (!result) {
+            printf("=== CLIENT FORCE-CLOSE FAILED (exit path incomplete) ===\n");
+            return 1;
+        }
+        /* One pass: the tree goes out level by level as each relative
+           timelock matures, so the caller re-runs this after each block. */
+        if (fr_res.settled)
+            printf("=== CLIENT FORCE-CLOSE COMPLETE: settled ===\n");
+        else
+            printf("=== CLIENT FORCE-CLOSE IN PROGRESS: %d of %d tree TXs "
+                   "confirmed, %d waiting for a parent or timelock; run "
+                   "--force-close again after the next block(s) until it "
+                   "reports settled ===\n",
+                   fr_res.n_confirmed, fr_res.n_txs, fr_res.n_waiting);
         return 0;
     }
 

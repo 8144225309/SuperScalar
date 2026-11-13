@@ -294,6 +294,53 @@ If the LSP process crashes (power failure, OOM, etc.):
 
 Without `--db`, crash recovery is not possible — you'll need to wait for CLTV timeout.
 
+### Publishing a factory tree from the DB (`recoverfactory`)
+
+`recoverfactory` publishes a factory's signed tree from the LSP's DB (a
+unilateral close of the whole factory, which cannot be undone). It is an admin
+JSON-RPC method on the socket given with `--rpc-file PATH`: one
+newline-terminated JSON-RPC 2.0 request per connection, for example
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"recoverfactory","params":{"factory_id":0}}' \
+  | socat - UNIX-CONNECT:/path/to/lsp.sock
+```
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `factory_id` | required | Factory to publish |
+| `dry_run` | `true` | Report what would be broadcast and send nothing. Pass `false` to publish. |
+
+One call is one pass: it broadcasts every TX whose parent is confirmed and
+whose timelocks have passed. Call it again after each block until `settled` is
+`true`; a tree level waits for its relative timelock before the next can go out.
+
+Reply fields: `factory_id`, `dry_run`, `ok` (`false` when part of the tree
+cannot be published; `status` says why), `status`, `broadcasts_made`,
+`would_broadcast` (dry run) or `n_broadcast`, `n_txs`, `n_confirmed`,
+`n_in_mempool`, `n_waiting` (parent unpublished or a timelock not reached yet),
+`n_failed`, `settled` (every leaf's current TX is confirmed).
+
+### A cooperative close that does not confirm (`closing`)
+
+Before the LSP sends the signed cooperative close to the clients (CLOSE_DONE)
+it queues that close and marks the factory `closing`. From then on any client
+can publish the close, so the LSP stops serving the factory: the daemon loop
+stops and no HTLC is accepted.
+
+On every start with `--db`, a `closing` factory is not served. The LSP
+re-broadcasts the queued close and exits: with 0 once the close has confirmed
+(the factory is then marked `closed`), with 1 while it has not.
+
+The LSP does not fee-bump the close. If it never confirms (for example its
+fee is too low and it was evicted from mempools), start the LSP with
+`--db ... --force-close-from-db`. That publishes the signed factory tree from
+the DB (one pass per run, like `recoverfactory`; run it again after each
+block). The close and the tree both spend the funding output, so whichever
+confirms first wins. Once the tree's root has confirmed the close can no
+longer confirm; keep running `--force-close-from-db` until it reports the tree
+settled, and the factory is marked `closed`.
+
 ## 8. Standalone Watchtower
 
 For defense-in-depth, run `superscalar_watchtower` on a separate machine. It opens a secret-less `wt.db` of pre-signed response transactions (penalty / sweep / poison TXs, **no secrets and no signing keys**) and independently monitors the blockchain:

@@ -211,6 +211,14 @@ typedef struct {
        collide.  state s's revealed secret is derived at the value this had when
        state s's L-stock output was built. */
     uint32_t l_stock_state_counter;
+    /* LSP side: l_stock_state_counter as of the newest state known to be in
+       the DB.  An on-request reveal (MSG_LSTOCK_REVEAL_REQUEST) hands out only
+       states below it, so after a failed write the superseded state, which the
+       DB still holds, is never revealed.  Unset (0) means "the in-memory state
+       is the stored one" (creation, load).  Set by the exit-path writes in
+       lsp_channels.c. */
+    int l_stock_durable_set;
+    uint32_t l_stock_durable_counter;
 
     /* Tier-B poison fix (gap-scan #105): snapshot of the SUPERSEDED state, captured in
        update_l_stock_outputs BEFORE the counter bump + hash re-commit (and before
