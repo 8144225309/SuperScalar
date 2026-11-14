@@ -16,6 +16,9 @@
 #include <signal.h>
 
 #include "superscalar/sha256.h"
+#include "test_auth_util.h"
+#include <fcntl.h>
+#include <poll.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -204,6 +207,13 @@ int test_reconnect_pubkey_match(void) {
     }
 
     /* Send MSG_RECONNECT from sv[1] as client 2 (index 2) */
+    if (!test_auth_secure_pair(sv[0], sv[1], NULL)) {
+        printf("  FAIL: %s: secure pair\n", __func__);
+        lsp_channels_cleanup(&mgr);
+        factory_free(factory); free(factory);
+        free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp);
+        return 0;
+    }
     {
         cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
         /* cppcheck-suppress memleak ; TEST_ASSERT leaks on failure — test-only, process exits */
@@ -216,6 +226,11 @@ int test_reconnect_pubkey_match(void) {
     pid_t pid = fork();
     if (pid == 0) {
         close(sv[0]);
+        {
+            unsigned char sec2[32];
+            memset(sec2, 0x23, 32);  /* client 2 secret */
+            if (!test_auth_answer(sv[1], sec2, MSG_RECONNECT)) _exit(7);
+        }
 
         /* Recv CHANNEL_NONCES from LSP */
         wire_msg_t nm;
@@ -270,7 +285,7 @@ int test_reconnect_pubkey_match(void) {
     }
 
     /* Parent: handle reconnect from sv[0] */
-    close(sv[1]);
+    wire_close(sv[1]);
     int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
     TEST_ASSERT(ok, "handle_reconnect failed");
 
@@ -2528,6 +2543,7 @@ static int setup_reconnect_env(secp256k1_context **ctx_out,
 static void child_nonce_exchange(int fd, int client_idx,
                                   secp256k1_pubkey lsp_pk,
                                   unsigned char client_sec[32]) {
+    if (!test_auth_answer(fd, client_sec, MSG_RECONNECT)) _exit(7);
     secp256k1_context *cctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     secp256k1_pubkey cpk;
@@ -2601,6 +2617,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
 
+    TEST_ASSERT(test_auth_secure_pair(sv[0], sv[1], NULL), "secure pair");
     cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
     TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
     cJSON_Delete(reconn);
@@ -2612,7 +2629,7 @@ int test_reconnect_commitment_mismatch_rollback(void) {
         _exit(0);
     }
 
-    close(sv[1]);
+    wire_close(sv[1]);
     int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
     TEST_ASSERT(ok, "handle_reconnect should succeed with rollback");
 
@@ -2676,12 +2693,16 @@ int test_reconnect_commitment_mismatch_reject(void) {
     int sv2[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0, "socketpair2");
 
+    TEST_ASSERT(test_auth_secure_pair(sv2[0], sv2[1], NULL), "secure pair");
     cJSON *reconn2 = wire_build_reconnect(ctx, &client_pks[2], 0);
     TEST_ASSERT(wire_send(sv2[1], MSG_RECONNECT, reconn2), "send reconnect2");
     cJSON_Delete(reconn2);
-    close(sv2[1]);
+    pid_t ans2 = test_auth_answer_fork(sv2[1], client_secs[2], MSG_RECONNECT);
+    TEST_ASSERT(ans2 > 0, "fork");
+    wire_close(sv2[1]);
 
     int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv2[0]);
+    waitpid(ans2, NULL, 0);
     TEST_ASSERT(!ok, "handle_reconnect should fail for large mismatch");
 
     /* Also test: no persistence + mismatch by 1 → fails */
@@ -2691,12 +2712,16 @@ int test_reconnect_commitment_mismatch_reject(void) {
     int sv3[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv3) == 0, "socketpair3");
 
+    TEST_ASSERT(test_auth_secure_pair(sv3[0], sv3[1], NULL), "secure pair");
     cJSON *reconn3 = wire_build_reconnect(ctx, &client_pks[2], 0);
     TEST_ASSERT(wire_send(sv3[1], MSG_RECONNECT, reconn3), "send reconnect3");
     cJSON_Delete(reconn3);
-    close(sv3[1]);
+    pid_t ans3 = test_auth_answer_fork(sv3[1], client_secs[2], MSG_RECONNECT);
+    TEST_ASSERT(ans3 > 0, "fork");
+    wire_close(sv3[1]);
 
     ok = lsp_channels_handle_reconnect(&mgr, lsp, sv3[0]);
+    waitpid(ans3, NULL, 0);
     TEST_ASSERT(!ok, "handle_reconnect should fail without persistence");
 
     lsp_channels_cleanup(&mgr);
@@ -2721,6 +2746,7 @@ static void child_reconnect_pending_cs(int fd, int client_idx,
                                         unsigned char client_sec[32],
                                         int mode, const unsigned char *secret,
                                         int expect_ack) {
+    if (!test_auth_answer(fd, client_sec, MSG_RECONNECT)) _exit(7);
     secp256k1_context *cctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     secp256k1_pubkey cpk;
@@ -2843,6 +2869,7 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
 
         int sv[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        TEST_ASSERT(test_auth_secure_pair(sv[0], sv[1], NULL), "secure pair");
         cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 1);
         TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
         cJSON_Delete(reconn);
@@ -2857,7 +2884,7 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
                                            round, bad, 0);
             _exit(0);
         }
-        close(sv[1]);
+        wire_close(sv[1]);
         int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
         uint64_t pending = 0;
         int has_pending = persist_load_pending_cs(&db, mgr.entries[2].channel_id,
@@ -2939,6 +2966,7 @@ int test_reconnect_htlc_replay(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
 
+    TEST_ASSERT(test_auth_secure_pair(sv[0], sv[1], NULL), "secure pair");
     cJSON *reconn = wire_build_reconnect(ctx, &client_pks[1], 0);
     TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
     cJSON_Delete(reconn);
@@ -2946,6 +2974,7 @@ int test_reconnect_htlc_replay(void) {
     pid_t pid = fork();
     if (pid == 0) {
         close(sv[0]);
+        if (!test_auth_answer(sv[1], client_secs[1], MSG_RECONNECT)) _exit(7);
         secp256k1_context *cctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
         secp256k1_pubkey cpk;
@@ -3012,7 +3041,7 @@ int test_reconnect_htlc_replay(void) {
         _exit(0);
     }
 
-    close(sv[1]);
+    wire_close(sv[1]);
     uint64_t cn_before = dest_ch->commitment_number;
     uint64_t local_before = dest_ch->local_amount;
     int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
@@ -3624,6 +3653,280 @@ int test_distribution_tx_verification(void) {
     tx_buf_free(&utx); tx_buf_free(&stx); tx_buf_free(&dtx); tx_buf_free(&dstx);
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+/* --- A reconnect names a client key; the peer must prove it holds it --- */
+
+static int fd_open(int fd) { return fcntl(fd, F_GETFD) != -1; }
+
+/* 1 if nothing has arrived on fd and its peer has not closed it. */
+static int fd_quiet(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    return poll(&p, 1, 0) == 0;
+}
+
+/* An impostor that knows only the victim's public key: a real Noise NK
+   handshake (it authenticates the LSP, not the impostor), then
+   MSG_RECONNECT naming the victim.  mode 0 answers the key challenge with
+   a signature by its own key, mode 1 skips the proof and goes on with the
+   reconnect (CHANNEL_NONCES), mode 2 replays proof64.  Exits 0 iff the LSP
+   sent nothing but the challenge and then closed the connection. */
+static void child_impostor(int fd, const unsigned char *lsp_sec,
+                           secp256k1_pubkey victim_pk, int mode,
+                           const unsigned char *proof64) {
+    secp256k1_context *c = test_ctx();
+    secp256k1_pubkey lsp_pk;
+    if (!secp256k1_ec_pubkey_create(c, &lsp_pk, lsp_sec)) _exit(9);
+    if (!wire_noise_handshake_nk_initiator(fd, c, &lsp_pk)) _exit(10);
+    cJSON *rc = wire_build_reconnect(c, &victim_pk, 0);
+    if (!wire_send(fd, MSG_RECONNECT, rc)) _exit(11);
+    cJSON_Delete(rc);
+
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    if (!wire_recv_timeout(fd, &m, 10)) _exit(12);
+    if (m.msg_type != MSG_CLIENT_AUTH_CHALLENGE) _exit(13);
+    unsigned char chal[32], h[32], sig[64];
+    if (wire_json_get_hex(m.json, "challenge", chal, 32) != 32) _exit(14);
+    cJSON_Delete(m.json);
+
+    if (mode == 1) {
+        unsigned char nonces[1][66];
+        memset(nonces, 0, sizeof(nonces));
+        cJSON *n = wire_build_channel_nonces(2,
+            (const unsigned char (*)[66])nonces, 1);
+        wire_send(fd, MSG_CHANNEL_NONCES, n);
+        cJSON_Delete(n);
+    } else {
+        if (mode == 0) {
+            unsigned char own[32];
+            secp256k1_keypair kp;
+            memset(own, 0x77, 32);
+            if (!secp256k1_keypair_create(c, &kp, own) ||
+                !wire_get_session_hash(fd, h) ||
+                !wire_client_auth_sign(c, &kp, chal, MSG_RECONNECT, h, sig))
+                _exit(15);
+        } else {
+            memcpy(sig, proof64, 64);
+        }
+        cJSON *p = cJSON_CreateObject();
+        wire_json_add_hex(p, "sig", sig, 64);
+        wire_send(fd, MSG_CLIENT_AUTH_PROOF, p);
+        cJSON_Delete(p);
+    }
+
+    memset(&m, 0, sizeof(m));
+    if (wire_recv_timeout(fd, &m, 10)) {
+        if (m.json) cJSON_Delete(m.json);
+        _exit(16);   /* the LSP went on with the claim */
+    }
+    _exit(0);
+}
+
+/* Run child_impostor against the LSP over a real NK handshake.  Returns
+   the result of lsp_channels_handle_reconnect; *child_rc gets the
+   impostor's exit code. */
+static int run_impostor(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                        const unsigned char *lsp_sec,
+                        secp256k1_pubkey victim_pk, int mode,
+                        const unsigned char *proof64, int close_fd,
+                        int *child_rc) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        if (close_fd >= 0) close(close_fd);
+        child_impostor(sv[1], lsp_sec, victim_pk, mode, proof64);
+    }
+    close(sv[1]);
+    int ok = wire_noise_handshake_nk_responder(sv[0], mgr->ctx, lsp_sec) &&
+             lsp_channels_handle_reconnect(mgr, lsp, sv[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    *child_rc = WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+    return ok;
+}
+
+/* An impostor that knows only a member's public key cannot take over its
+   session: its MSG_RECONNECT gets a key challenge and nothing else, it is
+   dropped, and the member's live connection and channel are untouched. */
+int test_reconnect_impostor_refused(void) {
+    secp256k1_context *ctx;
+    unsigned char lsp_sec[32];
+    secp256k1_pubkey lsp_pk;
+    unsigned char client_secs[4][32];
+    secp256k1_pubkey client_pks[4];
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) { free(factory); return 0; }
+    lsp_channel_mgr_t mgr;
+    persist_t db;
+    TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                client_secs, factory, lsp, &mgr, &db),
+                "setup_reconnect_env failed");
+
+    /* Client 2 is connected. */
+    int live[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, live) == 0, "socketpair");
+    lsp->client_fds[2] = live[0];
+    channel_t *ch = &mgr.entries[2].channel;
+    uint64_t cn = ch->commitment_number, la = ch->local_amount,
+             ra = ch->remote_amount;
+    size_t nh = ch->n_htlcs;
+
+    for (int mode = 0; mode < 2; mode++) {
+        int rc = -1;
+        int ok = run_impostor(&mgr, lsp, lsp_sec, client_pks[2], mode, NULL,
+                              live[1], &rc);
+        TEST_ASSERT(!ok, "the impostor is refused");
+        TEST_ASSERT_EQ(rc, 0, "the impostor got nothing but the challenge");
+        TEST_ASSERT_EQ(lsp->client_fds[2], live[0], "client 2 keeps its fd");
+        TEST_ASSERT(fd_open(live[0]), "the live connection is open");
+        TEST_ASSERT(fd_quiet(live[1]), "the member saw nothing");
+        TEST_ASSERT(ch->commitment_number == cn && ch->local_amount == la &&
+                    ch->remote_amount == ra && ch->n_htlcs == nh,
+                    "the channel is untouched");
+    }
+
+    close(live[1]);
+    lsp_channels_cleanup(&mgr);
+    persist_close(&db);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* An honest reconnect proves the key and goes through.  The proof it sent
+   is good for that connection and challenge only: replayed by another
+   peer on a later connection, it is refused and the member's session is
+   untouched. */
+int test_reconnect_auth_replay_refused(void) {
+    secp256k1_context *ctx;
+    unsigned char lsp_sec[32];
+    secp256k1_pubkey lsp_pk;
+    unsigned char client_secs[4][32];
+    secp256k1_pubkey client_pks[4];
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    if (!factory) return 0;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) { free(factory); return 0; }
+    lsp_channel_mgr_t mgr;
+    persist_t db;
+    TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                client_secs, factory, lsp, &mgr, &db),
+                "setup_reconnect_env failed");
+
+    /* The member reconnects over a real NK session and reports the proof
+       it sent. */
+    int sv[2], pp[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(pipe(pp) == 0, "pipe");
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        close(pp[0]);
+        secp256k1_context *c = test_ctx();
+        secp256k1_keypair kp;
+        unsigned char chal[32], h[32], sig[64];
+        if (!secp256k1_keypair_create(c, &kp, client_secs[2]) ||
+            !wire_noise_handshake_nk_initiator(sv[1], c, &lsp_pk)) _exit(20);
+        cJSON *rc = wire_build_reconnect(c, &client_pks[2], 0);
+        if (!wire_send(sv[1], MSG_RECONNECT, rc)) _exit(21);
+        cJSON_Delete(rc);
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv_timeout(sv[1], &m, 10) ||
+            m.msg_type != MSG_CLIENT_AUTH_CHALLENGE ||
+            wire_json_get_hex(m.json, "challenge", chal, 32) != 32) _exit(22);
+        cJSON_Delete(m.json);
+        if (!wire_get_session_hash(sv[1], h) ||
+            !wire_client_auth_sign(c, &kp, chal, MSG_RECONNECT, h, sig))
+            _exit(23);
+        cJSON *p = cJSON_CreateObject();
+        wire_json_add_hex(p, "sig", sig, 64);
+        if (!wire_send(sv[1], MSG_CLIENT_AUTH_PROOF, p)) _exit(24);
+        cJSON_Delete(p);
+        if (write(pp[1], sig, 64) != 64) _exit(25);
+        close(pp[1]);
+        /* the reconnect goes on: nonce exchange, RECONNECT_ACK */
+        wire_msg_t nm;
+        if (!wire_recv(sv[1], &nm) || nm.msg_type != MSG_CHANNEL_NONCES)
+            _exit(26);
+        cJSON_Delete(nm.json);
+        secp256k1_pubkey cpk;
+        secp256k1_ec_pubkey_create(c, &cpk, client_secs[2]);
+        unsigned char nonces[MUSIG_NONCE_POOL_MAX][66];
+        for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+            secp256k1_musig_secnonce sn;
+            secp256k1_musig_pubnonce pn;
+            musig_keyagg_t ka;
+            secp256k1_pubkey pks[2] = {lsp_pk, cpk};
+            musig_aggregate_keys(c, &ka, pks, 2);
+            musig_generate_nonce(c, &sn, &pn, client_secs[2], &cpk, &ka.cache);
+            musig_pubnonce_serialize(c, nonces[i], &pn);
+        }
+        cJSON *reply = wire_build_channel_nonces(2,
+            (const unsigned char (*)[66])nonces, MUSIG_NONCE_POOL_MAX);
+        wire_send(sv[1], MSG_CHANNEL_NONCES, reply);
+        cJSON_Delete(reply);
+        wire_msg_t ack;
+        if (!wire_recv(sv[1], &ack) || ack.msg_type != MSG_RECONNECT_ACK)
+            _exit(27);
+        cJSON_Delete(ack.json);
+        /* stay connected until the parent is done */
+        char b;
+        if (read(sv[1], &b, 1) < 0) { /* the parent closed it */ }
+        _exit(0);
+    }
+    close(sv[1]);
+    close(pp[1]);
+    int ok = wire_noise_handshake_nk_responder(sv[0], ctx, lsp_sec) &&
+             lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
+    unsigned char proof[64];
+    ssize_t got = read(pp[0], proof, 64);
+    close(pp[0]);
+    TEST_ASSERT(ok, "the honest reconnect goes through");
+    TEST_ASSERT(got == 64, "proof recorded");
+    TEST_ASSERT_EQ(lsp->client_fds[2], sv[0], "client 2 is on the new fd");
+
+    channel_t *ch = &mgr.entries[2].channel;
+    uint64_t cn = ch->commitment_number, la = ch->local_amount,
+             ra = ch->remote_amount;
+
+    /* Another peer replays that proof on a connection of its own. */
+    int rc = -1;
+    int rok = run_impostor(&mgr, lsp, lsp_sec, client_pks[2], 2, proof, -1,
+                           &rc);
+    TEST_ASSERT(!rok, "the replayed proof is refused");
+    TEST_ASSERT_EQ(rc, 0, "the replayer got nothing but the challenge");
+    TEST_ASSERT_EQ(lsp->client_fds[2], sv[0], "client 2 keeps its fd");
+    TEST_ASSERT(fd_open(sv[0]), "the member's connection is open");
+    TEST_ASSERT(ch->commitment_number == cn && ch->local_amount == la &&
+                ch->remote_amount == ra, "the channel is untouched");
+
+    wire_close(sv[0]);
+    lsp->client_fds[2] = -1;
+    int st = 0;
+    waitpid(pid, &st, 0);
+    TEST_ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                "the member saw an ordinary reconnect");
+
+    lsp_channels_cleanup(&mgr);
+    persist_close(&db);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
     secp256k1_context_destroy(ctx);
     return 1;
 }

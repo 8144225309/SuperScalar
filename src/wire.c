@@ -15,6 +15,11 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
+#include <secp256k1_schnorrsig.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -113,6 +118,8 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
     case 0x90: return "JIT_REJECT";
+    case 0x91: return "CLIENT_AUTH_CHALLENGE";
+    case 0x92: return "CLIENT_AUTH_PROOF";
     case 0x55: return "STATE_ADVANCE_PROPOSE";
     case 0x73: return "SUBFACTORY_PROPOSE";
     case 0x74: return "SUBFACTORY_NONCE";
@@ -2107,6 +2114,150 @@ int wire_parse_invoice_bolt11(const cJSON *json,
         bolt11[bolt11_len - 1] = '\0';
     }
     return 1;
+}
+
+/* --- Client authentication --- */
+
+/* Fresh random bytes; no fallback: 0 if none can be had. */
+static int wire_rand_bytes(unsigned char *buf, size_t len) {
+#ifdef __linux__
+    ssize_t got = getrandom(buf, len, 0);
+    if (got == (ssize_t)len) return 1;
+#endif
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = read(fd, buf + off, len - off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        off += (size_t)r;
+    }
+    close(fd);
+    return off == len;
+}
+
+int wire_client_auth_digest(const secp256k1_context *ctx,
+                            const unsigned char challenge[32],
+                            uint8_t purpose,
+                            const secp256k1_pubkey *pubkey,
+                            const unsigned char session_hash[32],
+                            unsigned char out32[32]) {
+    if (!ctx || !challenge || !pubkey || !session_hash || !out32) return 0;
+    if (purpose != MSG_HELLO && purpose != MSG_RECONNECT) return 0;
+    static const char pid[] = WIRE_CLIENT_AUTH_PROTOCOL_ID;
+    unsigned char buf[1 + sizeof(pid) - 1 + 1 + 32 + 33 + 32];
+    size_t o = 0, len = 33;
+    buf[o++] = (unsigned char)(sizeof(pid) - 1);
+    memcpy(buf + o, pid, sizeof(pid) - 1); o += sizeof(pid) - 1;
+    buf[o++] = purpose;
+    memcpy(buf + o, challenge, 32); o += 32;
+    if (!secp256k1_ec_pubkey_serialize(ctx, buf + o, &len, pubkey,
+                                        SECP256K1_EC_COMPRESSED) || len != 33)
+        return 0;
+    o += 33;
+    memcpy(buf + o, session_hash, 32); o += 32;
+    sha256_tagged("SuperScalar/client-auth", buf, o, out32);
+    return 1;
+}
+
+int wire_client_auth_sign(const secp256k1_context *ctx,
+                          const secp256k1_keypair *keypair,
+                          const unsigned char challenge[32],
+                          uint8_t purpose,
+                          const unsigned char session_hash[32],
+                          unsigned char sig64[64]) {
+    if (!ctx || !keypair || !sig64) return 0;
+    secp256k1_pubkey pk;
+    unsigned char digest[32], aux[32];
+    if (!secp256k1_keypair_pub(ctx, &pk, keypair) ||
+        !wire_client_auth_digest(ctx, challenge, purpose, &pk, session_hash,
+                                 digest) ||
+        !wire_rand_bytes(aux, 32))
+        return 0;
+    return secp256k1_schnorrsig_sign32(ctx, sig64, digest, keypair, aux);
+}
+
+int wire_client_auth_verify(const secp256k1_context *ctx,
+                            const unsigned char sig64[64],
+                            const unsigned char challenge[32],
+                            uint8_t purpose,
+                            const secp256k1_pubkey *pubkey,
+                            const unsigned char session_hash[32]) {
+    if (!ctx || !sig64 || !pubkey) return 0;
+    unsigned char digest[32];
+    secp256k1_xonly_pubkey xpk;
+    if (!wire_client_auth_digest(ctx, challenge, purpose, pubkey,
+                                 session_hash, digest) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &xpk, NULL, pubkey))
+        return 0;
+    return secp256k1_schnorrsig_verify(ctx, sig64, digest, 32, &xpk);
+}
+
+int wire_client_auth_challenge(const secp256k1_context *ctx, int fd,
+                               uint8_t purpose,
+                               const secp256k1_pubkey *pubkey) {
+    if (!ctx || fd < 0 || !pubkey) return 0;
+    unsigned char session_hash[32], challenge[32], sig64[64];
+    if (!wire_get_session_hash(fd, session_hash) ||
+        !wire_rand_bytes(challenge, 32))
+        return 0;
+
+    int ok = 0;
+    cJSON *c = cJSON_CreateObject();
+    if (!c) goto out;
+    wire_json_add_hex(c, "challenge", challenge, 32);
+    int sent = wire_send(fd, MSG_CLIENT_AUTH_CHALLENGE, c);
+    cJSON_Delete(c);
+    if (!sent) goto out;
+
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    if (!wire_recv_timeout(fd, &m, WIRE_CLIENT_AUTH_TIMEOUT_SEC)) {
+        if (m.json) cJSON_Delete(m.json);
+        goto out;
+    }
+    if (m.msg_type == MSG_CLIENT_AUTH_PROOF && m.json) {
+        const cJSON *s = cJSON_GetObjectItem(m.json, "sig");
+        if (s && cJSON_IsString(s) && strlen(s->valuestring) == 128 &&
+            wire_json_get_hex(m.json, "sig", sig64, 64) == 64)
+            ok = wire_client_auth_verify(ctx, sig64, challenge, purpose,
+                                         pubkey, session_hash);
+    }
+    if (m.json) cJSON_Delete(m.json);
+out:
+    /* the challenge is good for this attempt only */
+    secure_zero(challenge, sizeof(challenge));
+    return ok;
+}
+
+int wire_client_auth_respond(const secp256k1_context *ctx, int fd,
+                             const secp256k1_keypair *keypair,
+                             uint8_t purpose, int timeout_sec) {
+    if (!ctx || fd < 0 || !keypair) return 0;
+    unsigned char session_hash[32], challenge[32], sig64[64];
+    if (!wire_get_session_hash(fd, session_hash)) return 0;
+
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    if (!wire_recv_timeout(fd, &m, timeout_sec)) {
+        if (m.json) cJSON_Delete(m.json);
+        return 0;
+    }
+    int got = m.msg_type == MSG_CLIENT_AUTH_CHALLENGE && m.json &&
+              wire_json_get_hex(m.json, "challenge", challenge, 32) == 32;
+    if (m.json) cJSON_Delete(m.json);
+    if (!got ||
+        !wire_client_auth_sign(ctx, keypair, challenge, purpose, session_hash,
+                               sig64))
+        return 0;
+
+    cJSON *p = cJSON_CreateObject();
+    if (!p) return 0;
+    wire_json_add_hex(p, "sig", sig64, 64);
+    int ok = wire_send(fd, MSG_CLIENT_AUTH_PROOF, p);
+    cJSON_Delete(p);
+    return ok;
 }
 
 /* --- Reconnection messages (Phase 16) --- */

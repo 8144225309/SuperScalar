@@ -11,6 +11,10 @@ typedef struct {
     unsigned char recv_key[32];
     uint64_t send_nonce;       /* incremented per message */
     uint64_t recv_nonce;
+    /* Session binding: equal at both ends of one handshake and different
+       for every other handshake (see noise.c).  A client signs it to prove
+       its identity within this connection only (wire_client_auth_sign). */
+    unsigned char handshake_hash[32];
 } noise_state_t;
 
 /* Perform ECDH handshake as initiator (client side).
@@ -60,6 +64,11 @@ int wire_mark_encryption_required(int fd);
 
 /* Check if an fd requires encryption. Returns 1 if required, 0 otherwise. */
 int wire_is_encryption_required(int fd);
+
+/* Copy the session binding (noise_state_t.handshake_hash) of fd's
+   encrypted session into out32.  Returns 0 if fd has no encrypted
+   session. */
+int wire_get_session_hash(int fd, unsigned char out32[32]);
 
 /* Crypto primitives used by handshake */
 void hmac_sha256(unsigned char out[32], const unsigned char *key, size_t key_len,

@@ -11,6 +11,12 @@ All notable changes to SuperScalar are documented here.
 - **Invalid revocations fail the channel.** A peer could answer a commitment update with a revocation that does not verify and keep an older commitment that can never be penalised. Such a revocation now fails the channel: nothing on it is watched, revealed or forwarded, the peer is disconnected and refused, and the failure is persisted unless it arrived on a session opened by a reconnect; the client applies its `--on-lsp-forgery` policy to an LSP revocation that does not verify.
 - **Every revoked commitment is watched.** Revoked commitments beyond the watchtower's first 128 were dropped silently, so a breach of one went unpunished. The watch table now grows as needed and is fully reloaded on restart, and a revoked commitment that cannot be watched fails the channel.
 
+### Client authentication
+
+Wire protocol change: a client without it is refused.
+
+- **A client proves its key before the LSP acts on a HELLO or `MSG_RECONNECT`.** Both messages only name a client key, and the Noise NK handshake authenticates the LSP, not the client. The LSP now answers each of them with `MSG_CLIENT_AUTH_CHALLENGE` (0x91), 32 fresh random bytes, and the client returns `MSG_CLIENT_AUTH_PROOF` (0x92), a BIP340 signature by the named key over `SHA256_tagged("SuperScalar/client-auth", protocol id || message type || challenge || pubkey || session binding)`. The session binding is a hash both ends derive from their Noise handshake (`wire_get_session_hash`), so a proof is good for one challenge on one connection only. The check runs on the first HELLO of a factory, on every `MSG_RECONNECT`, and on a HELLO from a known client that the LSP turns into a reconnect, before the LSP touches the client's channel, nonces or existing connection. A peer that does not prove the key is dropped and the client's live connection is left as it is.
+
 ### A member decides its HTLCs from its own state
 
 Operator-visible behaviour changes.

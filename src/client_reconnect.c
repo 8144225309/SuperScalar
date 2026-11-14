@@ -176,6 +176,14 @@ int client_run_reconnect(secp256k1_context *ctx,
             return 0;
         }
         cJSON_Delete(reconn);
+        /* Prove our key on this connection before the LSP acts on it. */
+        if (!wire_client_auth_respond(ctx, fd, keypair, MSG_RECONNECT, 120)) {
+            fprintf(stderr, "Client reconnect: no key challenge from LSP, "
+                    "or cannot answer it\n");
+            wire_close(fd);
+            factory_free(factory); free(factory);
+            return 0;
+        }
     }
 
     /* 6. Load basepoints from persistence */

@@ -664,6 +664,8 @@ static void retry_distribution_txs(lsp_channel_mgr_t *mgr) {
 
 /* Forward declarations for daemon_loop_once */
 static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp, int fd, const wire_msg_t *msg);
+static int handle_hello_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  int fd, const cJSON *json);
 int lsp_accept_and_queue_connection(void *mgr_ptr, void *lsp_ptr);
 
 /* Single iteration: drain queue, poll for 1 second, return. */
@@ -693,35 +695,8 @@ int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             handle_reconnect_with_msg(mgr, lsp, qfd, &qmsg);
             if (qjson) cJSON_Delete(qjson);
         } else if (qtype == MSG_HELLO) {
-            unsigned char pk_buf[33];
-            secp256k1_pubkey pk;
-            if (qjson && wire_json_get_hex(qjson, "pubkey", pk_buf, 33) == 33 &&
-                secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                int slot = -1;
-                for (size_t s = 0; s < lsp->n_clients; s++) {
-                    unsigned char s1[33], s2[33];
-                    size_t l1 = 33, l2 = 33;
-                    if (secp256k1_ec_pubkey_serialize(mgr->ctx, s1, &l1,
-                            &lsp->client_pubkeys[s], SECP256K1_EC_COMPRESSED) &&
-                        secp256k1_ec_pubkey_serialize(mgr->ctx, s2, &l2,
-                            &pk, SECP256K1_EC_COMPRESSED) &&
-                        memcmp(s1, s2, 33) == 0) { slot = (int)s; break; }
-                }
-                if (slot >= 0) {
-                    cJSON_Delete(qjson);
-                    uint64_t cn = mgr->entries[slot].channel.commitment_number;
-                    qjson = wire_build_reconnect(mgr->ctx, &pk, cn);
-                    wire_msg_t qmsg = { .msg_type = MSG_RECONNECT, .json = qjson };
-                    handle_reconnect_with_msg(mgr, lsp, qfd, &qmsg);
-                    cJSON_Delete(qjson);
-                } else {
-                    if (qjson) cJSON_Delete(qjson);
-                    wire_close(qfd);
-                }
-            } else {
-                if (qjson) cJSON_Delete(qjson);
-                wire_close(qfd);
-            }
+            handle_hello_reconnect(mgr, lsp, qfd, qjson);
+            if (qjson) cJSON_Delete(qjson);
         } else {
             if (qjson) cJSON_Delete(qjson);
             wire_close(qfd);
@@ -6731,6 +6706,9 @@ static int find_client_slot_by_pubkey(const lsp_t *lsp,
     return -1;
 }
 
+static int reconnect_client(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd,
+                            size_t c, uint64_t commitment_number);
+
 /* Core reconnect handler that takes an already-read MSG_RECONNECT message. */
 static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        int new_fd, const wire_msg_t *msg) {
@@ -6746,30 +6724,65 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* 3. Match pubkey against lsp->client_pubkeys[] to find client index */
-    int found = -1;
-    unsigned char client_ser[33], cmp_ser[33];
-    size_t len1 = 33, len2 = 33;
-    if (!secp256k1_ec_pubkey_serialize(mgr->ctx, client_ser, &len1, &client_pk,
-                                        SECP256K1_EC_COMPRESSED))
-        return 0;
-    for (size_t c = 0; c < lsp->n_clients; c++) {
-        len2 = 33;
-        if (!secp256k1_ec_pubkey_serialize(mgr->ctx, cmp_ser, &len2,
-                                            &lsp->client_pubkeys[c],
-                                            SECP256K1_EC_COMPRESSED))
-            return 0;
-        if (memcmp(client_ser, cmp_ser, 33) == 0) {
-            found = (int)c;
-            break;
-        }
-    }
-
-    if (found < 0) {
+    int found = find_client_slot_by_pubkey(lsp, mgr->ctx, &client_pk);
+    if (found < 0 || (size_t)found >= mgr->n_channels) {
         fprintf(stderr, "LSP reconnect: unknown pubkey\n");
         wire_close(new_fd);
         return 0;
     }
-    size_t c = (size_t)found;
+
+    /* The peer proves it holds the key it named, on this connection, before
+       the LSP touches the client's channel, nonces or connection. */
+    if (!wire_client_auth_challenge(mgr->ctx, new_fd, MSG_RECONNECT,
+                                    &client_pk)) {
+        fprintf(stderr, "LSP reconnect: peer does not prove the key it "
+                "names -- closing the new connection\n");
+        wire_close(new_fd);
+        return 0;
+    }
+    return reconnect_client(mgr, lsp, new_fd, (size_t)found,
+                            commitment_number);
+}
+
+/* A HELLO from a client that already has a channel (it lost its state):
+   once the peer proves it holds the key it names, the client is reconnected
+   at the LSP state.  An unknown or unproven HELLO only closes the new
+   connection. */
+static int handle_hello_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  int new_fd, const cJSON *json) {
+    if (!mgr || !lsp || new_fd < 0) return 0;
+    unsigned char pk_buf[33];
+    secp256k1_pubkey pk;
+    if (!json || wire_json_get_hex(json, "pubkey", pk_buf, 33) != 33 ||
+        !secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
+        wire_close(new_fd);
+        return 0;
+    }
+    int slot = find_client_slot_by_pubkey(lsp, mgr->ctx, &pk);
+    if (slot < 0 || (size_t)slot >= mgr->n_channels) {
+        wire_close(new_fd);
+        return 0;
+    }
+    if (!wire_client_auth_challenge(mgr->ctx, new_fd, MSG_HELLO, &pk)) {
+        fprintf(stderr, "LSP: HELLO does not prove the key it names -- "
+                "closing the new connection\n");
+        wire_close(new_fd);
+        return 0;
+    }
+    fprintf(stderr, "LSP: HELLO from known client %d (lost state?), "
+            "reconnecting it at the LSP state\n", slot);
+    int ret = reconnect_client(mgr, lsp, new_fd, (size_t)slot,
+                               mgr->entries[slot].channel.commitment_number);
+    if (!ret)
+        fprintf(stderr, "LSP: HELLO->reconnect failed for slot %d (state "
+                "mismatch -- client needs --db)\n", slot);
+    return ret;
+}
+
+/* Reconnect client c, whose key the peer on new_fd has proven to hold, at
+   the commitment number the peer holds. */
+static int reconnect_client(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd,
+                            size_t c, uint64_t commitment_number) {
 
     /* A failed channel is never resumed: nothing may be re-signed on it. */
     if (lsp_channels_client_failed(mgr, c)) {
@@ -7922,40 +7935,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 lsp_channels_flush_bridge_fulfils(mgr);
                 printf("LSP: bridge connected (deferred, fd=%d)\n", qfd);
             } else if (qtype == MSG_HELLO) {
-                /* HELLO from known client — try reconnect */
-                unsigned char pk_buf[33];
-                secp256k1_pubkey pk;
-                if (qjson &&
-                    wire_json_get_hex(qjson, "pubkey", pk_buf, 33) == 33 &&
-                    secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                    int slot = -1;
-                    for (size_t s = 0; s < lsp->n_clients; s++) {
-                        unsigned char s1[33], s2[33];
-                        size_t l1 = 33, l2 = 33;
-                        if (secp256k1_ec_pubkey_serialize(mgr->ctx, s1, &l1,
-                                &lsp->client_pubkeys[s], SECP256K1_EC_COMPRESSED) &&
-                            secp256k1_ec_pubkey_serialize(mgr->ctx, s2, &l2,
-                                &pk, SECP256K1_EC_COMPRESSED) &&
-                            memcmp(s1, s2, 33) == 0) {
-                            slot = (int)s;
-                            break;
-                        }
-                    }
-                    if (slot >= 0) {
-                        cJSON_Delete(qjson);
-                        uint64_t cn = mgr->entries[slot].channel.commitment_number;
-                        qjson = wire_build_reconnect(mgr->ctx, &pk, cn);
-                        wire_msg_t qmsg = { .msg_type = MSG_RECONNECT, .json = qjson };
-                        handle_reconnect_with_msg(mgr, lsp, qfd, &qmsg);
-                        cJSON_Delete(qjson);
-                    } else {
-                        if (qjson) cJSON_Delete(qjson);
-                        wire_close(qfd);
-                    }
-                } else {
-                    if (qjson) cJSON_Delete(qjson);
-                    wire_close(qfd);
-                }
+                /* HELLO from a known client: reconnect once it is proven */
+                handle_hello_reconnect(mgr, lsp, qfd, qjson);
+                if (qjson) cJSON_Delete(qjson);
             } else {
                 if (qjson) cJSON_Delete(qjson);
                 wire_close(qfd);
@@ -8890,33 +8872,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
                             }
                         } else if (peek.msg_type == MSG_HELLO) {
-                            /* Client reconnecting without state — check if known pubkey */
-                            unsigned char pk_buf[33];
-                            secp256k1_pubkey pk;
-                            if (wire_json_get_hex(peek.json, "pubkey", pk_buf, 33) == 33 &&
-                                secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                                int slot = find_client_slot_by_pubkey(lsp, mgr->ctx, &pk);
-                                if (slot >= 0) {
-                                    fprintf(stderr, "LSP daemon: MSG_HELLO from known client %d "
-                                            "(lost state?), attempting reconnect\n", slot);
-                                    cJSON_Delete(peek.json);
-                                    uint64_t cn = mgr->entries[slot].channel.commitment_number;
-                                    peek.json = wire_build_reconnect(mgr->ctx, &pk, cn);
-                                    peek.msg_type = MSG_RECONNECT;
-                                    int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
-                                    cJSON_Delete(peek.json);
-                                    if (!ret) {
-                                        fprintf(stderr, "LSP daemon: HELLO->reconnect failed for "
-                                                "slot %d (state mismatch — client needs --db)\n", slot);
-                                    }
-                                } else {
-                                    cJSON_Delete(peek.json);
-                                    wire_close(new_fd);
-                                }
-                            } else {
-                                cJSON_Delete(peek.json);
-                                wire_close(new_fd);
-                            }
+                            /* Client reconnecting without state */
+                            handle_hello_reconnect(mgr, lsp, new_fd, peek.json);
+                            cJSON_Delete(peek.json);
                         } else {
                             fprintf(stderr, "LSP daemon: unexpected msg 0x%02x from new connection\n",
                                     peek.msg_type);

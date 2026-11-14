@@ -1,6 +1,7 @@
 /* ECDH handshake + HMAC-SHA256/HKDF + per-fd encryption state */
 #include "superscalar/noise.h"
 #include "superscalar/types.h"
+#include "superscalar/sha256.h"
 #include <secp256k1_ecdh.h>
 #include <string.h>
 #include <stdio.h>
@@ -214,6 +215,13 @@ int wire_mark_encryption_required(int fd) {
     return 0;
 }
 
+int wire_get_session_hash(int fd, unsigned char out32[32]) {
+    noise_state_t *ns = wire_get_encryption(fd);
+    if (!ns || !out32) return 0;
+    memcpy(out32, ns->handshake_hash, 32);
+    return 1;
+}
+
 int wire_is_encryption_required(int fd) {
     if (!ensure_fd_table()) return 1;  /* fail safe: require encryption */
     for (int i = 0; i < fd_table_cap; i++) {
@@ -225,11 +233,49 @@ int wire_is_encryption_required(int fd) {
 
 /* --- Handshake --- */
 
+#define NOISE_PATTERN_NN 0x00
+#define NOISE_PATTERN_NK 0x01
+
+/* Session binding (noise_state_t.handshake_hash):
+     SHA256_tagged("SuperScalar/noise-session",
+                   pattern || e_init || e_resp || s_resp || exporter)
+   e_init / e_resp are the two ephemeral keys (33-byte compressed), s_resp
+   is the responder's static key under NK (33 zero bytes under NN) and
+   exporter = HKDF-Expand(prk, "session binding", 32) comes from the same
+   secret the transport keys come from.  The responder draws a fresh
+   ephemeral key for every connection, so no two connections to it share
+   a binding, and a peer that is not one of the two ends cannot compute
+   it. */
+static void derive_session_hash(noise_state_t *ns, const unsigned char prk[32],
+                                unsigned char pattern,
+                                const unsigned char e_init[33],
+                                const unsigned char e_resp[33],
+                                const unsigned char *s_resp33) {
+    unsigned char buf[1 + 33 + 33 + 33 + 32];
+    unsigned char exporter[32];
+    const char *info = "session binding";
+    hkdf_expand(exporter, 32, prk, (const unsigned char *)info, strlen(info));
+    buf[0] = pattern;
+    memcpy(buf + 1, e_init, 33);
+    memcpy(buf + 34, e_resp, 33);
+    if (s_resp33)
+        memcpy(buf + 67, s_resp33, 33);
+    else
+        memset(buf + 67, 0, 33);
+    memcpy(buf + 100, exporter, 32);
+    sha256_tagged("SuperScalar/noise-session", buf, sizeof(buf),
+                  ns->handshake_hash);
+    secure_zero(exporter, sizeof(exporter));
+    secure_zero(buf, sizeof(buf));
+}
+
 /* Derive symmetric keys from ECDH shared secret.
    Initiator uses: send_key="initiator", recv_key="responder"
    Responder swaps them. */
 static void derive_keys(noise_state_t *ns, const unsigned char shared[32],
-                         int is_initiator) {
+                         int is_initiator,
+                         const unsigned char e_init[33],
+                         const unsigned char e_resp[33]) {
     /* prk = HKDF-Extract(salt="superscalar-v1", ikm=shared) */
     unsigned char prk[32];
     const char *salt = "superscalar-v1";
@@ -250,6 +296,7 @@ static void derive_keys(noise_state_t *ns, const unsigned char shared[32],
     }
     ns->send_nonce = 0;
     ns->recv_nonce = 0;
+    derive_session_hash(ns, prk, NOISE_PATTERN_NN, e_init, e_resp, NULL);
 
     secure_zero(prk, 32);
     secure_zero(key_init, 32);
@@ -322,7 +369,7 @@ int noise_handshake_initiator(noise_state_t *ns, int fd,
     }
 
     /* Derive symmetric keys */
-    derive_keys(ns, shared, 1);
+    derive_keys(ns, shared, 1, pub_ser, remote_ser);
 
     secure_zero(eph_sec, 32);
     secure_zero(shared, 32);
@@ -372,7 +419,7 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
     }
 
     /* Derive symmetric keys (is_initiator=0, so keys swapped) */
-    derive_keys(ns, shared, 0);
+    derive_keys(ns, shared, 0, remote_ser, pub_ser);
 
     secure_zero(eph_sec, 32);
     secure_zero(shared, 32);
@@ -386,7 +433,10 @@ int noise_handshake_responder(noise_state_t *ns, int fd,
 static void derive_keys_nk(noise_state_t *ns,
                              const unsigned char shared_ee[32],
                              const unsigned char shared_es[32],
-                             int is_initiator) {
+                             int is_initiator,
+                             const unsigned char e_init[33],
+                             const unsigned char e_resp[33],
+                             const unsigned char s_resp[33]) {
     unsigned char combined[64];
     memcpy(combined, shared_ee, 32);
     memcpy(combined + 32, shared_es, 32);
@@ -410,6 +460,7 @@ static void derive_keys_nk(noise_state_t *ns,
     }
     ns->send_nonce = 0;
     ns->recv_nonce = 0;
+    derive_session_hash(ns, prk, NOISE_PATTERN_NK, e_init, e_resp, s_resp);
 
     secure_zero(prk, 32);
     secure_zero(key_init, 32);
@@ -474,7 +525,16 @@ int noise_handshake_nk_initiator(noise_state_t *ns, int fd,
         return 0;
     }
 
-    derive_keys_nk(ns, shared_ee, shared_es, 1);
+    unsigned char s_ser[33];
+    size_t s_len = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, s_ser, &s_len, server_pubkey,
+                                        SECP256K1_EC_COMPRESSED)) {
+        secure_zero(eph_sec, 32);
+        secure_zero(shared_ee, 32);
+        secure_zero(shared_es, 32);
+        return 0;
+    }
+    derive_keys_nk(ns, shared_ee, shared_es, 1, pub_ser, remote_ser, s_ser);
 
     secure_zero(eph_sec, 32);
     secure_zero(shared_ee, 32);
@@ -535,7 +595,18 @@ int noise_handshake_nk_responder(noise_state_t *ns, int fd,
         return 0;
     }
 
-    derive_keys_nk(ns, shared_ee, shared_es, 0);
+    secp256k1_pubkey s_pub;
+    unsigned char s_ser[33];
+    size_t s_len = 33;
+    if (!secp256k1_ec_pubkey_create(ctx, &s_pub, static_seckey32) ||
+        !secp256k1_ec_pubkey_serialize(ctx, s_ser, &s_len, &s_pub,
+                                        SECP256K1_EC_COMPRESSED)) {
+        secure_zero(eph_sec, 32);
+        secure_zero(shared_ee, 32);
+        secure_zero(shared_es, 32);
+        return 0;
+    }
+    derive_keys_nk(ns, shared_ee, shared_es, 0, remote_ser, pub_ser, s_ser);
 
     secure_zero(eph_sec, 32);
     secure_zero(shared_ee, 32);
