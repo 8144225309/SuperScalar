@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 43
+#define PERSIST_SCHEMA_VERSION 44
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -417,6 +417,20 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *remote_amount,
                                  uint64_t *commitment_number);
 
+/* Mark a channel failed (channels.state = 'failed'): its peer did not
+   validly revoke a commitment, or a revoked commitment could not be watched.
+   A restarted LSP keeps refusing updates on it.  persist_save_channel()
+   writes the same state from channel_t.revocation_failed, so re-saving the
+   channel keeps the mark and a new channel saved at that slot starts 'open'.
+   Returns 1 on success. */
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id);
+
+/* Same for a JIT channel (jit_channels.revocation_failed). */
+int persist_mark_jit_failed(persist_t *p, uint32_t jit_channel_id);
+
+/* 1 if the channel's row is marked failed, 0 otherwise (or no row). */
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id);
+
 /* Update channel balances after a payment. */
 int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
                                      uint64_t local_amount,
@@ -542,6 +556,26 @@ int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
 int persist_save_old_commitment_csv_delay(persist_t *p, uint32_t channel_id,
                                             uint64_t commit_num,
                                             uint32_t csv_delay);
+
+/* One old_commitments row (see persist_load_all_old_commitments). */
+typedef struct {
+    uint32_t channel_id;
+    uint64_t commit_num;
+    unsigned char txid[32];
+    uint32_t to_local_vout;
+    uint64_t to_local_amount;
+    unsigned char to_local_spk[34];
+    size_t to_local_spk_len;
+    uint32_t csv_delay;
+} persist_old_commitment_row_t;
+
+/* Load every old_commitments row, for all channels, with no cap, ordered by
+   (channel_id, commit_num).  *rows_out is heap-allocated (caller frees; NULL
+   when there are no rows).  Returns 1 on success (including zero rows), 0 on
+   a DB or allocation error. */
+int persist_load_all_old_commitments(persist_t *p,
+                                     persist_old_commitment_row_t **rows_out,
+                                     size_t *n_out);
 
 /* Load old commitments for a channel. Returns count loaded.
    csv_delays parameter (v32+) may be NULL for legacy callers; 0 = unset. */

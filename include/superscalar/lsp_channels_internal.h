@@ -15,6 +15,56 @@
 void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                          size_t client_idx, uint64_t old_cn);
 
+/* Fail a client's channel that can no longer safely advance (see
+   channel_t.revocation_failed): mark it, persist the mark, and disconnect the
+   client.  ch is the client's factory channel (or NULL for it) or its JIT
+   channel.  While the mark is set every message from the client is dropped
+   and its reconnects are refused; the operator must force-close the channel.
+
+   peer_fault is 1 when the client's own message caused the failure (a
+   revocation that does not verify).  Such a failure on a session opened by
+   MSG_RECONNECT is kept in memory only (CHANNEL_FAILED_SESSION); an LSP
+   restart clears it.
+   Every other failure is persisted (CHANNEL_FAILED_DURABLE). */
+void lsp_channels_fail_channel(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                               size_t client_idx, channel_t *ch,
+                               int peer_fault, const char *reason);
+
+/* 1 if the client's factory channel or its JIT channel has failed. */
+int lsp_channels_client_failed(lsp_channel_mgr_t *mgr, size_t client_idx);
+
+/* Apply a client's REVOKE_AND_ACK for the commitment it just replaced on `ch`:
+   parse it, check the next per-commitment point, and store the revocation
+   secret (verified at the channel_receive_revocation choke point).  On
+   success returns 1 with *old_cn_out (the revoked commitment number) and
+   *next_pcp_out set (either may be NULL).  It does NOT record the next point.
+
+   On any failure the channel is failed (lsp_channels_fail_channel) and 0 is
+   returned.  The caller must then abort the ceremony: no watch, no LSP
+   revocation, and nothing forwarded or settled that relies on the old
+   commitment being revoked. */
+SS_MUST_CHECK int (lsp_channels_accept_revocation)(lsp_channel_mgr_t *mgr,
+        lsp_t *lsp, size_t client_idx, channel_t *ch, const cJSON *raa_json,
+        uint64_t *old_cn_out, secp256k1_pubkey *next_pcp_out);
+#define lsp_channels_accept_revocation(...) \
+    ((lsp_channels_accept_revocation)(__VA_ARGS__) != 0)
+
+/* lsp_channels_accept_revocation(), then register the revoked commitment
+   (described by old_local/old_remote/old_htlcs/old_ptlcs) with the LSP's
+   watchtower under wt_channel_id, then record the client's next
+   per-commitment point.  The snapshots may alias ch->htlcs / ch->ptlcs.
+   Same failure contract: on 0 the channel has been failed (a revoked
+   commitment that cannot be watched is as unsafe as one never revoked). */
+SS_MUST_CHECK int (lsp_channels_accept_raa)(lsp_channel_mgr_t *mgr,
+        lsp_t *lsp, size_t client_idx, channel_t *ch,
+        uint32_t wt_channel_id, const cJSON *raa_json,
+        uint64_t old_local, uint64_t old_remote,
+        const htlc_t *old_htlcs, size_t old_n_htlcs,
+        const ptlc_t *old_ptlcs, size_t old_n_ptlcs,
+        uint64_t *old_cn_out, secp256k1_pubkey *next_pcp_out);
+#define lsp_channels_accept_raa(...) \
+    ((lsp_channels_accept_raa)(__VA_ARGS__) != 0)
+
 /* Rotation retry helpers.
    Returns:  1 = ready to retry, -1 = max retries exhausted (fallback),
              0 = no action (not attempted, or delay not elapsed, or already handled). */

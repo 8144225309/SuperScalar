@@ -121,6 +121,18 @@ int persist_wt_supersede_watch(persist_wt_t *pwt, int64_t watch_id,
    health heartbeat row.  Returns -1 on error. */
 int persist_wt_count_active_watches(const persist_wt_t *pwt);
 
+/* Block height from which the tower has to look for the transactions it
+   watches for: every block below it has been searched already.  The tower
+   reads it at start and moves it up as it scans, so that a tower that was
+   stopped for any number of blocks still searches all the blocks it missed
+   (transactions are found by scanning blocks; no -txindex is needed).
+   get returns 1 and sets *h_out when a height is stored, else 0.
+   set stores h unconditionally; note stores it only when none is stored yet.
+   set and note return 1 on success. */
+int persist_wt_get_scan_from(const persist_wt_t *pwt, int *h_out);
+int persist_wt_set_scan_from(persist_wt_t *pwt, int h);
+int persist_wt_note_scan_from(persist_wt_t *pwt, int h);
+
 /* SF-WT-TRUSTLESS Phase 2c — list active watches of a given kind.
  *
  * Used by the WT-side hydration helper (watchtower_hydrate_from_wt_db)

@@ -624,8 +624,8 @@ int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_nu
     return memcmp(d_ser, c_ser, 33) == 0;
 }
 
-int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
-                                      const unsigned char *secret32) {
+int (channel_receive_revocation_flat)(channel_t *ch, uint64_t commitment_num,
+                                        const unsigned char *secret32) {
     /* Revocation-verification standard (choke point): EVERY received revocation
        secret — via any path (LSP handlers, htlc_commit, client, bridge) — is
        verified here against the peer's committed point before it is stored. A
@@ -1115,8 +1115,8 @@ int channel_get_revocation_secret(const channel_t *ch, uint64_t old_commitment_n
     return channel_get_per_commitment_secret(ch, old_commitment_num, secret_out32);
 }
 
-int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
-                                 const unsigned char *secret32) {
+int (channel_receive_revocation)(channel_t *ch, uint64_t commitment_num,
+                                   const unsigned char *secret32) {
     return channel_receive_revocation_flat(ch, commitment_num, secret32);
 }
 
@@ -1541,6 +1541,14 @@ int channel_create_commitment_partial_sig(
     unsigned char *partial_sig32_out,
     uint32_t *nonce_index_out)
 {
+    /* Never sign a new state on a failed channel: the peer still holds an
+       older commitment it did not validly revoke. */
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel: refusing to sign a new commitment on a failed "
+                "channel (force-close required)\n");
+        return 0;
+    }
+
     /* 1. Determine nonce index = remote_nonce_next (consumed in order) */
     uint32_t nidx = (uint32_t)ch->remote_nonce_next;
     if (nidx >= ch->remote_nonce_count) return 0;
@@ -1828,6 +1836,11 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (ch->funding_pending_reorg) {
         fprintf(stderr, "channel_add_htlc: refused — funding UTXO pending "
                 "reorg (waiting for re-confirmation)\n");
+        return 0;
+    }
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel_add_htlc: refused: channel failed (the peer "
+                "did not validly revoke a commitment); force-close required\n");
         return 0;
     }
     if (ch->n_htlcs >= MAX_HTLCS) {
