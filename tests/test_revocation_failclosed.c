@@ -32,9 +32,9 @@
 #include "superscalar/musig.h"
 #include "superscalar/sha256.h"
 #include "cJSON.h"
-#include <errno.h>
+#include "test_auth_util.h"
+#include <sys/wait.h>
 #include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,105 +241,6 @@ static void rfc_drain(int fd, rfc_inbox_t *in) {
         rfc_count(in, m.msg_type);
         if (m.json) cJSON_Delete(m.json);
     }
-}
-
-/* The client end of a reconnect, read while the handler runs.
-
-   The handlers run on the test's thread, so whatever they send waits in the
-   socket until they return.  A reconnect's CHANNEL_NONCES carries the LSP's
-   whole nonce pool (about 35 KB): that fits in a Linux AF_UNIX socket buffer
-   but not in the 8 KB macOS default, where the LSP's send blocks until
-   SO_SNDTIMEO, fails, and the reconnect ends before the step under test.
-   So the client end is read on a second thread.  It only reads bytes (the
-   wire layer's per-fd table is not thread-safe); the frames are counted
-   after the join.  rfc_peer_socketpair also sets the buffers to that 8 KB,
-   so Linux runs these tests under the same limit as macOS. */
-typedef struct {
-    int fd;
-    unsigned char *buf;
-    size_t len, cap;
-    int stop;
-    pthread_mutex_t mu;
-    pthread_t th;
-} rfc_peer_t;
-
-#define RFC_PEER_SOCKBUF 8192
-
-static int rfc_peer_socketpair(int sv[2]) {
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
-    int b = RFC_PEER_SOCKBUF;
-    for (int k = 0; k < 2; k++) {
-        setsockopt(sv[k], SOL_SOCKET, SO_SNDBUF, &b, sizeof b);
-        setsockopt(sv[k], SOL_SOCKET, SO_RCVBUF, &b, sizeof b);
-    }
-    return 1;
-}
-
-static void *rfc_peer_main(void *arg) {
-    rfc_peer_t *p = (rfc_peer_t *)arg;
-    for (;;) {
-        struct pollfd pfd;
-        pfd.fd = p->fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int pr = poll(&pfd, 1, 100);
-        if (pr < 0 && errno == EINTR) continue;
-        if (pr < 0) break;
-        if (pr == 0) {
-            /* Idle.  Once the handler has returned it sends nothing more,
-               so everything it sent has been read. */
-            pthread_mutex_lock(&p->mu);
-            int stop = p->stop;
-            pthread_mutex_unlock(&p->mu);
-            if (stop) break;
-            continue;
-        }
-        if (p->len == p->cap) {
-            size_t ncap = p->cap ? p->cap * 2 : 65536;
-            unsigned char *nb = (unsigned char *)realloc(p->buf, ncap);
-            if (!nb) break;
-            p->buf = nb;
-            p->cap = ncap;
-        }
-        ssize_t n = read(p->fd, p->buf + p->len, p->cap - p->len);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;  /* EOF: the LSP closed the connection */
-        p->len += (size_t)n;
-    }
-    return NULL;
-}
-
-static int rfc_peer_start(rfc_peer_t *p, int fd) {
-    memset(p, 0, sizeof *p);
-    p->fd = fd;
-    if (pthread_mutex_init(&p->mu, NULL) != 0) return 0;
-    if (pthread_create(&p->th, NULL, rfc_peer_main, p) != 0) {
-        pthread_mutex_destroy(&p->mu);
-        return 0;
-    }
-    return 1;
-}
-
-/* Call after the handler returned: stop the reader and count the whole
-   (plaintext) frames it read.  A frame cut short is not counted. */
-static void rfc_peer_finish(rfc_peer_t *p, rfc_inbox_t *in) {
-    pthread_mutex_lock(&p->mu);
-    p->stop = 1;
-    pthread_mutex_unlock(&p->mu);
-    pthread_join(p->th, NULL);
-    pthread_mutex_destroy(&p->mu);
-    memset(in, 0, sizeof *in);
-    size_t off = 0;
-    while (p->len - off >= 5) {
-        const unsigned char *h = p->buf + off;
-        uint32_t flen = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) |
-                        ((uint32_t)h[2] << 8) | (uint32_t)h[3];
-        if (flen < 1 || p->len - off - 4 < flen) break;
-        rfc_count(in, h[4]);
-        off += 4 + (size_t)flen;
-    }
-    free(p->buf);
-    p->buf = NULL;
 }
 
 static int rfc_stored(rfc_t *f, size_t i, uint64_t cn) {
@@ -600,27 +501,68 @@ int test_lsp_fulfill_settles_upstream_after_invalid_revocation(void) {
     return 1;
 }
 
-/* Queue MSG_RECONNECT for client i on fd. */
-static int rfc_queue_reconnect(rfc_t *f, size_t i, int fd) {
+/* A reconnect by client i, its client side in a child process.  The client
+   proves its key (MSG_CLIENT_AUTH_CHALLENGE), then answers the LSP's
+   CHANNEL_NONCES with its own and a retransmitted COMMITMENT_SIGNED with a
+   revocation of commitment 0 (valid or not) when raa >= 0; it counts what
+   the LSP sent.  The child reads while the handler writes, so the LSP's
+   nonce pool never blocks on a small socket buffer.  Returns the handler's
+   result; *in gets the counts. */
+static int rfc_run_reconnect(rfc_t *f, size_t i, int raa, rfc_inbox_t *in) {
+    memset(in, 0, sizeof *in);
+    int rc[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, rc) != 0 || pipe(pp) != 0) return -1;
+    /* 8 KB buffers, as on macOS: the child reads while the LSP writes */
+    int b = 8192;
+    for (int k = 0; k < 2; k++) {
+        setsockopt(rc[k], SOL_SOCKET, SO_SNDBUF, &b, sizeof b);
+        setsockopt(rc[k], SOL_SOCKET, SO_RCVBUF, &b, sizeof b);
+    }
+    if (!test_auth_secure_pair(rc[0], rc[1], NULL)) return -1;
     cJSON *j = wire_build_reconnect(f->ctx, &f->client_pk[i],
                                     f->mgr.entries[i].channel.commitment_number);
-    int ok = j && wire_send(fd, MSG_RECONNECT, j);
+    int ok = j && wire_send(rc[1], MSG_RECONNECT, j);
     cJSON_Delete(j);
-    return ok;
+    if (!ok) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pp[0]);
+        rfc_inbox_t got;
+        memset(&got, 0, sizeof got);
+        unsigned char sec[32];
+        memset(sec, 0x22 + (int)i, 32);
+        if (test_auth_answer(rc[1], sec, MSG_RECONNECT)) {
+            wire_msg_t m;
+            while (wire_recv_timeout(rc[1], &m, 2)) {
+                rfc_count(&got, m.msg_type);
+                if (m.msg_type == MSG_CHANNEL_NONCES) {
+                    cJSON *nj = wire_build_channel_nonces((uint32_t)i,
+                        (const unsigned char (*)[66])f->pubnonces[i], RFC_NONCES);
+                    if (nj) wire_send(rc[1], MSG_CHANNEL_NONCES, nj);
+                    cJSON_Delete(nj);
+                } else if (m.msg_type == MSG_COMMITMENT_SIGNED && raa >= 0) {
+                    rfc_queue_raa_on(f, i, rc[1], 0, raa);
+                }
+                if (m.json) cJSON_Delete(m.json);
+            }
+        }
+        _exit(write(pp[1], &got, sizeof got) == (ssize_t)sizeof got ? 0 : 1);
+    }
+    close(pp[1]);
+    wire_close(rc[1]);
+    int ret = lsp_channels_handle_reconnect(&f->mgr, &f->lsp, rc[0]);
+    if (read(pp[0], in, sizeof *in) != (ssize_t)sizeof *in) ret = -1;
+    close(pp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return ret;
 }
 
 /* A reconnect attempt by client i is refused: the handler fails and sends
    the client nothing (no nonce exchange, no ack). */
 static int rfc_reconnect_refused(rfc_t *f, size_t i) {
-    int rc[2];
-    if (!rfc_peer_socketpair(rc)) return 0;
-    if (!rfc_queue_reconnect(f, i, rc[1])) return 0;
-    rfc_peer_t peer;
-    if (!rfc_peer_start(&peer, rc[1])) return 0;
-    int ret = lsp_channels_handle_reconnect(&f->mgr, &f->lsp, rc[0]);
     rfc_inbox_t in;
-    rfc_peer_finish(&peer, &in);
-    close(rc[1]);
+    int ret = rfc_run_reconnect(f, i, -1, &in);
     return ret == 0 && in.nonces == 0 && in.acks == 0;
 }
 
@@ -644,21 +586,9 @@ static int rfc_reconnect_scenario(int valid, rfc_rc_result_t *r) {
     if (!persist_save_channel(&f->db, ch, 0, 0)) return 0;
     if (!persist_save_pending_cs(&f->db, 0, 1)) return 0;
 
-    int rc[2];
-    if (!rfc_peer_socketpair(rc)) return 0;
-    if (!rfc_queue_reconnect(f, 0, rc[1])) return 0;
-    cJSON *nj = wire_build_channel_nonces(0,
-        (const unsigned char (*)[66])f->pubnonces[0], RFC_NONCES);
-    int ok = nj && wire_send(rc[1], MSG_CHANNEL_NONCES, nj);
-    cJSON_Delete(nj);
-    if (!ok || !rfc_queue_raa_on(f, 0, rc[1], 0, valid)) return 0;
-
-    rfc_peer_t peer;
-    if (!rfc_peer_start(&peer, rc[1])) return 0;
-    r->ret = lsp_channels_handle_reconnect(&f->mgr, &f->lsp, rc[0]);
     rfc_inbox_t in;
-    rfc_peer_finish(&peer, &in);
-    close(rc[1]);
+    r->ret = rfc_run_reconnect(f, 0, valid, &in);
+    if (r->ret < 0) return 0;
     r->acks = in.acks;
     r->nonces = in.nonces;
     r->sigs = in.sigs;
