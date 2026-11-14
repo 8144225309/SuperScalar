@@ -34,6 +34,14 @@ Operator-visible behaviour changes.
 - **Sub-factory chains kept:** reorg alarms no longer reset sub-factory chains (they are off-chain until a force-close). Resetting them broke force-close of advanced sub-factories.
 - **Reorgs during downtime:** the detector's last tip is stored (schema v43 `reorg_tips`) and compared on the first poll after a restart.
 
+### Restart and reconnect persistence
+
+- **Restored channels keep writing to the DB.** After an LSP restart, and after any client reconnect or restart, the rebuilt channel had no DB attached, so revocation secrets and per-commitment points received afterwards were not written. The LSP now attaches the DB it restores from (and refuses a manager that names another one); the client attaches its DB to the channel it rebuilds.
+- **A client DB keeps its channel under one id** (`CLIENT_DB_CHANNEL_ID`, 0). Part of it was written under the client's index and part under 0, so for every client but the first the reconnect restored no commitment signature and the sweep and force-close paths found no basepoints or channel state.
+- **HTLC restore no longer overflows.** The restart and the reconnect commitment-number rollback copied up to 483 stored HTLCs into the 64 slots `channel_init` allocates. Only active HTLCs are loaded, the array grows to fit, and more than `MAX_HTLCS` fails the restart or refuses the reconnect.
+- **The DW counter is saved and restored.** Saves stored each layer's `config.max_states` as its state and wrote "0,0" over the per-leaf states; the restart ignored the epoch and the leaf states. Every save site, now including Tier B and rotation, writes the real state, and `persist_load_factory` restores it. A missing or out-of-range value loads as the layer's last state; a row that cannot be read fails the load.
+- **Failure paths free what they allocated:** a failed restore or `channel_init`, and every return of the client reconnect.
+
 ### Tree builder
 
 - **The factory is funded at the key its root spends.** The root kickoff aggregates the participants in placement order (`factory_compute_funding_spk`), but the LSP funding address, the rotation funding address and the persisted-factory reload derived the key from the participants in index order. With a placement mode and profiles that reorder the clients, the root could not spend the funding output (since PR #486 the build refuses it). All three now use `factory_compute_funding_spk`; new `lsp_compute_funding_spk` / `lsp_compute_funding_spk_for` give the script for an LSP's participants. A partial rotation funds the key of the cooperative clients it builds the new factory for, and aborts if one of them disconnects before the ceremony. `factory_client_to_leaf` now finds a member's channel in the built tree for every shape, so channels open on the leaf the placement put the member on.

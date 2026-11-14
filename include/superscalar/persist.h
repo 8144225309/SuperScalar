@@ -477,6 +477,10 @@ int persist_list_subfactory_chain_keys(persist_t *p,
 int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
                                size_t *count_out);
 
+/* A client DB holds one factory channel and keys every per-channel row by
+   this id.  (An LSP DB keys each channel by the client's index.) */
+#define CLIENT_DB_CHANNEL_ID 0
+
 /* Hydrate a channel_t with enough state for channel_build_penalty_tx().
    Zeroes *out_ch, allocates the dynamic arrays channel_init() would, and
    fills in basepoints + revocation secrets + balances from the DB.
@@ -534,6 +538,15 @@ int persist_save_htlc(persist_t *p, uint32_t channel_id,
 /* Load all HTLCs for a channel. Returns count loaded. */
 size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
                             htlc_t *htlcs_out, size_t max_htlcs);
+
+/* Replace ch's HTLCs with the active rows stored for channel_id, growing
+   ch->htlcs to fit.  Fulfilled and failed rows are skipped and do not
+   count.  Fails closed: returns -1 and leaves ch unchanged if there are
+   more active rows than a channel can hold (MAX_HTLCS), or on an
+   allocation or query error.  Otherwise returns the number of HTLCs now
+   in ch. */
+int persist_load_channel_htlcs(persist_t *p, uint32_t channel_id,
+                               channel_t *ch);
 
 /* Delete an HTLC entry (after settle/fail). */
 int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id);
@@ -838,14 +851,10 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
 
 /* --- DW counter state (Phase 23) --- */
 
-int persist_save_dw_counter(persist_t *p, uint32_t factory_id,
-                             uint32_t current_epoch, uint32_t n_layers,
-                             const uint32_t *layer_states);
-int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
-                             uint32_t *epoch_out, uint32_t *n_layers_out,
-                             uint32_t *layer_states_out, size_t max_layers);
-
-/* Extended versions with per-leaf DW state (N leaf nodes) */
+/* Extended versions with per-leaf DW state (N leaf nodes).  The save
+   records leaf_states, when given, whatever per_leaf_enabled is, so a row
+   holds every leaf.  The load fills leaf_states_out with the values the
+   row holds and leaves the other entries untouched. */
 int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          uint32_t current_epoch, uint32_t n_layers,
                                          const uint32_t *layer_states,
@@ -859,6 +868,27 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          uint32_t *leaf_states_out,
                                          int *n_leaf_nodes_out,
                                          size_t max_leaf_nodes);
+
+/* Save a factory's DW state: each counter layer's current_state, the
+   epoch, and the per-leaf states.  Returns 1 on success. */
+int persist_save_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  const factory_t *f);
+
+/* Restore the state saved above into f.  persist_load_factory calls this
+   after rebuilding the tree (factory_build_tree resets the counter).  A
+   value that is missing, cut short or out of range is restored as that
+   layer's last state: this wastes states but never reuses one.  Older
+   builds stored config.max_states as each layer state; such rows load
+   that way.  With per-leaf mode off, the leaf states the row records are
+   restored (this build records them all, and they are 0 then); an older
+   build's row records none, and past epoch 0 its leaves load as
+   exhausted.  Returns 1 if a row was applied (with a warning if some
+   values were restored as the last state), 0 if there is no row (f is
+   unchanged), -1 if the row could not be read (query or allocation
+   error).  persist_load_factory fails on -1: the counter would otherwise
+   stay at the initial state, behind states already signed. */
+int persist_load_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  factory_t *f);
 
 /* --- Departed clients (Phase 23) --- */
 

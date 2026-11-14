@@ -795,7 +795,7 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
    broadcast the commitment TX independently for trustless force-close. */
 static int client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
     if (!cbd || !cbd->db) return 0;
-    return client_persist_latest_commitment(cbd->db, 0, ch);
+    return client_persist_latest_commitment(cbd->db, CLIENT_DB_CHANNEL_ID, ch);
 }
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -873,19 +873,19 @@ static void client_persist_lsp_points(daemon_cb_data_t *cbd, channel_t *ch,
         slen = 33;
         secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
                                        SECP256K1_EC_COMPRESSED);
-        persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+        persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number + 1, ser);
     }
     if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
         slen = 33;
         secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
                                        SECP256K1_EC_COMPRESSED);
-        persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+        persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number, ser);
     }
     unsigned char pcs[32];
     if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-        persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
+        persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number, pcs);
     if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-        persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
+        persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number + 1, pcs);
     memset(pcs, 0, 32);
 }
 
@@ -1055,16 +1055,15 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
-            uint32_t client_idx = my_index - 1;
             /* Attach persistence so revocation secrets received later land in
                the revocation_secrets table (needed for standalone watchtower). */
-            channel_set_persist(ch, cbd->db, client_idx);
+            channel_set_persist(ch, cbd->db, CLIENT_DB_CHANNEL_ID);
             /* The signed commitment 0 received at channel open goes into the
                same transaction as the factory and channel rows: a channel is
                never on disk without a broadcastable commitment for it. */
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                persist_save_channel(cbd->db, ch, 0, client_idx) &&
-                persist_save_basepoints(cbd->db, client_idx, ch) &&
+                persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
+                persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
                 persist_save_tree_nodes(cbd->db, factory, 0) &&
                 client_persist_commitment_sig(ch, cbd)) {
                 /* Save the verified signed distribution TX */
@@ -1077,7 +1076,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
                     unsigned char pcs[32];
                     if (channel_get_local_pcs(ch, cn, pcs)) {
-                        persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                        persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, cn, pcs);
                         memset(pcs, 0, 32);
                     }
                 }
@@ -1092,7 +1091,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     if (channel_get_remote_pcp(ch, cn, &pcp) &&
                         secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
                                                       SECP256K1_EC_COMPRESSED))
-                        persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                        persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, cn, ser);
                 }
                 if (!persist_commit(cbd->db)) {
                     fprintf(stderr, "Client %u: initial persist commit failed\n", my_index);
@@ -1292,7 +1291,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     client_persist_commitment_sig(ch, cbd);
                     cJSON_Delete(imsg.json);
                     if (cbd && cbd->db)
-                        persist_update_channel_balance(cbd->db, my_index - 1,
+                        persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                             ch->local_amount, ch->remote_amount,
                             ch->commitment_number);
                 } else {
@@ -1515,7 +1514,7 @@ handle_message:
 
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
 
@@ -1543,7 +1542,7 @@ handle_message:
                     if (msg.json) cJSON_Delete(msg.json);
                 }
                 if (cbd && cbd->db)
-                    persist_update_channel_balance(cbd->db, my_index - 1,
+                    persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                         ch->local_amount, ch->remote_amount, ch->commitment_number);
                 memset(sett_preimage, 0, 32);
                 break;
@@ -1597,7 +1596,7 @@ handle_message:
                                 paid_inv->preimage, paid_inv->amount_msat,
                                 tip);
                             if (cbd && cbd->db)
-                                persist_update_channel_balance(cbd->db, my_index - 1,
+                                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                                     ch->local_amount, ch->remote_amount,
                                     ch->commitment_number);
                             break;
@@ -1640,7 +1639,7 @@ handle_message:
 
                     /* Persist balance after fulfill */
                     if (cbd && cbd->db) {
-                        persist_update_channel_balance(cbd->db, my_index - 1,
+                        persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                             ch->local_amount, ch->remote_amount, ch->commitment_number);
                     }
                 }
@@ -1660,7 +1659,7 @@ handle_message:
                 keypair, my_index);
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
@@ -1704,7 +1703,7 @@ handle_message:
             }
             /* Persist balance after fulfill */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
@@ -1742,7 +1741,7 @@ handle_message:
                 }
             }
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
@@ -2260,10 +2259,9 @@ handle_message:
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
                 if (persist_begin(cbd->db)) {
-                    uint32_t rot_client_idx = my_index - 1;
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                        persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
-                        persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
+                        persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
+                        persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0) &&
                         client_persist_commitment_sig(ch, cbd) &&
                         persist_delete_factory_record(cbd->db,
@@ -2279,7 +2277,7 @@ handle_message:
                         for (uint64_t cn = 0; rot_ok && cn < ch->n_local_pcs; cn++) {
                             unsigned char pcs[32];
                             if (channel_get_local_pcs(ch, cn, pcs)) {
-                                rot_ok = persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                                rot_ok = persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, cn, pcs);
                                 memset(pcs, 0, 32);
                             }
                         }
@@ -2291,7 +2289,7 @@ handle_message:
                             rot_ok = channel_get_remote_pcp(ch, cn, &pcp) &&
                                      secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
                                          &pcp, SECP256K1_EC_COMPRESSED) &&
-                                     persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                                     persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, cn, ser);
                         }
                         if (!rot_ok) {
                             persist_rollback(cbd->db);
@@ -2677,11 +2675,11 @@ static void usage(const char *prog) {
 static unsigned char *exit_load_commitment(persist_t *db, size_t *len_out,
                                            uint64_t *cn_out) {
     size_t len = 0, got = 0;
-    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, NULL, &len, 0) || len == 0)
+    if (!persist_load_commitment_sig(db, CLIENT_DB_CHANNEL_ID, cn_out, NULL, NULL, &len, 0) || len == 0)
         return NULL;
     unsigned char *buf = malloc(len);
     if (!buf) return NULL;
-    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, buf, &got, len) ||
+    if (!persist_load_commitment_sig(db, CLIENT_DB_CHANNEL_ID, cn_out, NULL, buf, &got, len) ||
         got != len) {
         free(buf);
         return NULL;
@@ -3634,10 +3632,10 @@ int main(int argc, char *argv[]) {
         const char *sweep_err = NULL;
         if (sweep_my_index == 0)
             sweep_err = "the keyfile's key is not a client of the factory in this DB";
-        else if (!persist_load_channel_state(&db, sweep_my_index - 1, &local_amt,
+        else if (!persist_load_channel_state(&db, CLIENT_DB_CHANNEL_ID, &local_amt,
                                              &remote_amt, &cn))
             sweep_err = "no channel state in DB";
-        else if (!persist_load_basepoints(&db, sweep_my_index - 1, local_secs,
+        else if (!persist_load_basepoints(&db, CLIENT_DB_CHANNEL_ID, local_secs,
                                           remote_bps_raw))
             sweep_err = "no basepoints in DB";
         else if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
@@ -3683,7 +3681,7 @@ int main(int argc, char *argv[]) {
             unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
             if (pcs_arr) {
                 size_t pcs_loaded = 0;
-                persist_load_local_pcs(&db, 0, pcs_arr, pcs_max, &pcs_loaded);
+                persist_load_local_pcs(&db, CLIENT_DB_CHANNEL_ID, pcs_arr, pcs_max, &pcs_loaded);
                 for (uint64_t c = 0; c < pcs_max; c++) {
                     int nonzero = 0;
                     for (int j = 0; j < 32; j++)

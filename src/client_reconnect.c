@@ -162,7 +162,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     /* 4. Load persisted channel state to get commitment_number */
     uint32_t client_idx = my_index - 1;  /* 0-based client index */
     uint64_t local_amount = 0, remote_amount = 0, commitment_number = 0;
-    persist_load_channel_state(db, client_idx, &local_amount, &remote_amount,
+    persist_load_channel_state(db, CLIENT_DB_CHANNEL_ID, &local_amount, &remote_amount,
                                  &commitment_number);
 
     /* 5. Send MSG_RECONNECT */
@@ -181,8 +181,8 @@ int client_run_reconnect(secp256k1_context *ctx,
     /* 6. Load basepoints from persistence */
     unsigned char local_secs[4][32];
     unsigned char remote_bps[4][33];
-    if (!persist_load_basepoints(db, client_idx, local_secs, remote_bps)) {
-        fprintf(stderr, "Client reconnect: no basepoints in DB for channel %u\n", client_idx);
+    if (!persist_load_basepoints(db, CLIENT_DB_CHANNEL_ID, local_secs, remote_bps)) {
+        fprintf(stderr, "Client reconnect: no basepoints in DB\n");
         wire_close(fd);
         factory_free(factory);
         free(factory);
@@ -214,6 +214,8 @@ int client_run_reconnect(secp256k1_context *ctx,
         return 0;
     }
     memset(local_secs, 0, sizeof(local_secs));
+    /* From here on, every return frees the channel (channel_cleanup
+       also zeroes its per-commitment secrets). */
 
     /* 7. Overwrite channel state with persisted values */
     if (local_amount > 0 || remote_amount > 0) {
@@ -229,7 +231,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
             if (pcs_arr) {
                 size_t pcs_loaded = 0;
-                persist_load_local_pcs(db, 0, pcs_arr, pcs_max, &pcs_loaded);
+                persist_load_local_pcs(db, CLIENT_DB_CHANNEL_ID, pcs_arr, pcs_max, &pcs_loaded);
                 for (uint64_t cn = 0; cn < pcs_max; cn++) {
                     /* Check if entry was loaded (non-zero) */
                     int nonzero = 0;
@@ -246,7 +248,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         /* Display any persisted in-flight HTLCs for user visibility */
         if (db) {
             htlc_t loaded_htlcs[16];
-            size_t n_loaded = persist_load_htlcs(db, client_idx,
+            size_t n_loaded = persist_load_htlcs(db, CLIENT_DB_CHANNEL_ID,
                                                    loaded_htlcs, 16);
             if (n_loaded > 0) {
                 printf("Client reconnect: %zu persisted HTLC(s) from DB:\n",
@@ -274,10 +276,10 @@ int client_run_reconnect(secp256k1_context *ctx,
         if (db) {
             unsigned char pcp_ser[33];
             secp256k1_pubkey pcp;
-            if (persist_load_remote_pcp(db, 0, commitment_number, pcp_ser) &&
+            if (persist_load_remote_pcp(db, CLIENT_DB_CHANNEL_ID, commitment_number, pcp_ser) &&
                 secp256k1_ec_pubkey_parse(ctx, &pcp, pcp_ser, 33))
                 channel_set_remote_pcp(&channel, commitment_number, &pcp);
-            if (persist_load_remote_pcp(db, 0, commitment_number + 1, pcp_ser) &&
+            if (persist_load_remote_pcp(db, CLIENT_DB_CHANNEL_ID, commitment_number + 1, pcp_ser) &&
                 secp256k1_ec_pubkey_parse(ctx, &pcp, pcp_ser, 33))
                 channel_set_remote_pcp(&channel, commitment_number + 1, &pcp);
         }
@@ -287,7 +289,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     if (db) {
         uint64_t sig_cn = 0;
         unsigned char sig64[64];
-        if (persist_load_commitment_sig(db, client_idx, &sig_cn, sig64,
+        if (persist_load_commitment_sig(db, CLIENT_DB_CHANNEL_ID, &sig_cn, sig64,
                                          NULL, NULL, 0) &&
             sig_cn == commitment_number) {
             memcpy(channel.latest_commitment_sig, sig64, 64);
@@ -295,6 +297,15 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
         memset(sig64, 0, 64);
     }
+
+    /* 7c. Attach the DB, under the same channel id as the first run (the
+       daemon's channel callback attaches it only on that first run).
+       Without it, revocation secrets and per-commitment points the LSP
+       sends after a reconnect or restart are never written to
+       revocation_secrets / the remote PCP table, which the standalone
+       watchtower reads.  Attached after the restore above, so restoring
+       writes nothing back. */
+    channel_set_persist(&channel, db, CLIENT_DB_CHANNEL_ID);
 
     /* 8. Nonce exchange — LSP sends CHANNEL_NONCES before RECONNECT_ACK */
     /* Receive LSP's pubnonces */
@@ -305,6 +316,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -318,6 +330,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -327,6 +340,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: nonce pool init failed\n");
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -337,6 +351,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         if (!my_pubnonces_ser) {
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         for (size_t i = 0; i < my_nonce_count; i++) {
@@ -355,6 +370,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             free(my_pubnonces_ser);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(nonce_reply);
@@ -377,6 +393,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: recv failed expecting RECONNECT_ACK\n");
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
@@ -388,6 +405,7 @@ int client_run_reconnect(secp256k1_context *ctx,
                 fprintf(stderr, "Client reconnect: recv failed after CS retransmit\n");
                 wire_close(fd);
                 factory_free(factory); free(factory);
+                channel_cleanup(&channel);
                 return 0;
             }
         }
@@ -397,6 +415,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -408,6 +427,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -431,7 +451,7 @@ int client_run_reconnect(secp256k1_context *ctx,
                         : " [LSP claims BEHIND us — possible replay]");
             if (db) {
                 uint64_t db_l, db_r, db_cn;
-                if (persist_load_channel_state(db, my_index - 1,
+                if (persist_load_channel_state(db, CLIENT_DB_CHANNEL_ID,
                         &db_l, &db_r, &db_cn)) {
                     channel.local_amount = db_l;
                     channel.remote_amount = db_r;
@@ -461,6 +481,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         /* Callback handled close */
         factory_free(factory); free(factory);
         wire_close(fd);
+        channel_cleanup(&channel);
         return 1;
     }
     if (cb_ret == 1) {
@@ -473,11 +494,13 @@ int client_run_reconnect(secp256k1_context *ctx,
                                                   &channel, &close_state, 0);
         factory_free(factory); free(factory);
         wire_close(fd);
+        channel_cleanup(&channel);
         return close_ok;
     }
 
     /* cb_ret == 0: error or disconnect */
     factory_free(factory); free(factory);
     wire_close(fd);
+    channel_cleanup(&channel);
     return 0;
 }

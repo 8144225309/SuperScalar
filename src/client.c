@@ -877,7 +877,7 @@ int client_force_close_plan(persist_t *db, chain_backend_t *chain,
     uint64_t cn = 0;
     size_t clen = 0;
     int has_commitment =
-        persist_load_commitment_sig(db, 0, &cn, NULL, NULL, &clen, 0) && clen > 0;
+        persist_load_commitment_sig(db, CLIENT_DB_CHANNEL_ID, &cn, NULL, NULL, &clen, 0) && clen > 0;
 
     if (!persist_has_factory(db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
         if (has_commitment) return 1;
