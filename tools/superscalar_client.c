@@ -1060,11 +1060,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
 
     if (cbd && cbd->htlc_sweeper) {
-        /* Claims are keyed by the channel row (client index) so they can be
+        /* Claims are keyed by the member's channel row so they can be
            rebuilt from the DB without this session. */
         client_set_htlc_live_channel(ch);
-        client_set_htlc_sweeper(cbd->htlc_sweeper,
-                                my_index > 0 ? my_index - 1 : 0);
+        client_set_htlc_sweeper(cbd->htlc_sweeper, CLIENT_DB_CHANNEL_ID);
     }
 
     /* #21: record whether this factory uses PS (CLTV-gated) leaves, for the
