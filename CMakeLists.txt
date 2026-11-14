@@ -393,6 +393,7 @@ add_executable(test_superscalar
     tests/test_reorg_tip.c
     tests/test_regtest_funding_reval.c
     tests/test_chain_lookup_errors.c
+    tests/test_watchtower_no_txindex.c
     tests/test_cli_arity.c
     tests/test_client_dist.c
     tests/test_tree_shape.c

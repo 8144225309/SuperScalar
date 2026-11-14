@@ -1126,7 +1126,7 @@ void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet)
         wt->wallet = wallet;
 }
 
-int watchtower_check(watchtower_t *wt) {
+static int watchtower_check_inner(watchtower_t *wt) {
     if (!wt || !wt->chain) return 0;
 
     /* Retry any previously failed penalty broadcasts */
@@ -1903,6 +1903,51 @@ int watchtower_check(watchtower_t *wt) {
     return penalties_broadcast;
 }
 
+/* Blocks below the chain tip that every pass searches again: a block the
+   tower saw while it was not yet deep enough to be final stays in range for a
+   reorganisation. */
+#define WT_SCAN_MARGIN 12
+
+/* Transactions the tower watches for are found by scanning blocks, and
+   -txindex is not needed.  A pass searches the last rt->scan_depth blocks,
+   and in addition every block since the stored scan floor, so that a tower
+   that was stopped for longer than that window (or started after the
+   transaction was mined) still sees the breach.  After a pass the floor
+   moves up to WT_SCAN_MARGIN blocks below the tip. */
+int watchtower_check(watchtower_t *wt) {
+    if (!wt || !wt->chain) return 0;
+
+    persist_wt_t *sdb = wt->scan_db ? wt->scan_db : wt->wt_db;
+    if (!wt->scan_floor_loaded) {
+        int h = 0;
+        if (sdb && persist_wt_get_scan_from(sdb, &h) && h > 0)
+            wt->scan_from = h;
+        wt->scan_floor_loaded = 1;
+    }
+
+    int tip = (wt->rt && wt->chain->get_block_height)
+              ? wt->chain->get_block_height(wt->chain) : 0;
+    int saved_depth = wt->rt ? wt->rt->scan_depth : 0;
+    if (tip > 0 && wt->scan_from > 0) {
+        int need = tip - wt->scan_from + 1;
+        if (need > wt->rt->scan_depth)
+            wt->rt->scan_depth = need;
+    }
+
+    int r = watchtower_check_inner(wt);
+
+    if (wt->rt) wt->rt->scan_depth = saved_depth;
+    if (tip > 0) {
+        int floor = tip - WT_SCAN_MARGIN;
+        if (floor > wt->scan_from) {
+            wt->scan_from = floor;
+            if (sdb) persist_wt_set_scan_from(sdb, floor);
+        }
+    }
+    return r;
+}
+
+
 /* --- CPFP child transaction builder (P2A anchor — no signing needed) --- */
 
 int watchtower_build_cpfp_tx(watchtower_t *wt,
@@ -2262,6 +2307,8 @@ static int wt_hydrate_row_cb(uint32_t factory_id,
 
 int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
     if (!wt || !pwt || !pwt->db) return -1;
+    wt->scan_db = pwt;
+    wt->scan_floor_loaded = 0;
 
     wt_hydrate_ctx_t ctx = { .wt = wt, .n_loaded = 0, .n_skipped = 0 };
 
@@ -2292,9 +2339,18 @@ int watchtower_hydrate_from_wt_db(watchtower_t *wt, persist_wt_t *pwt) {
     return ctx.n_loaded;
 }
 
+/* A new database starts its scan floor at the tip it is opened at: nothing
+   can be watched for from before that. */
+static void note_scan_floor(watchtower_t *wt, persist_wt_t *pwt) {
+    if (!pwt || !wt->rt || !wt->chain || !wt->chain->get_block_height) return;
+    int tip = wt->chain->get_block_height(wt->chain);
+    if (tip > 0) persist_wt_note_scan_from(pwt, tip);
+}
+
 void watchtower_set_wt_db(watchtower_t *wt, persist_wt_t *wt_db) {
     if (!wt) return;
     wt->wt_db = wt_db;
+    note_scan_floor(wt, wt_db);
 }
 
 void watchtower_register_autosettle(watchtower_t *wt,

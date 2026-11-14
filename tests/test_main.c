@@ -2396,6 +2396,10 @@ static void run_unit_tests(void) {
     extern int test_regtest_conf_conflicted_wallet_tx(void);
     RUN_TEST(test_regtest_conf_stops_at_first_unreachable);
     RUN_TEST(test_regtest_conf_conflicted_wallet_tx);
+    extern int test_watchtower_finds_breach_below_window(void);
+    extern int test_watchtower_window_without_floor(void);
+    RUN_TEST(test_watchtower_finds_breach_below_window);
+    RUN_TEST(test_watchtower_window_without_floor);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
