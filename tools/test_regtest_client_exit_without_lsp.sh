@@ -29,7 +29,9 @@
 #               factory's lifetime and one a block short of the forced-exit
 #               window after it, before it funds anything; the earliest
 #               allowed one is accepted by the LSP and by every member.
-#   forcedexit  The members go silent after some payments; the LSP stays up.
+#   forcedexit  The members go silent once their channels are open (the
+#               LSP's --demo payments are LSP-initiated, which members refuse
+#               since they decide their own HTLCs); the LSP stays up.
 #               From the forced-exit height it pushes every member's path and
 #               its own co-signed latest commitment on chain, all confirmed
 #               before the end date; at the end date no channel payout is
@@ -454,7 +456,7 @@ print("allowed" if r.get("allowed") else r.get("reject-reason","?"))'
 scenario_forcedexit() {
     local d=$T/forcedexit
     say "=== forcedexit: the LSP pushes silent members on chain before the end date"
-    factory_up "$d" 29970 --daemon --demo --active-blocks 20 --dying-blocks 10 || return
+    factory_up "$d" 29970 --daemon --active-blocks 20 --dying-blocks 10 || return
     wait_grep "$d/lsp.log" "entering daemon mode" 600 mine || { fail "LSP not in daemon mode"; return; }
     clients_ready "$d" || return
     sleep 5
