@@ -957,6 +957,19 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         out_idx++;
     }
 
+    /* 7d. BOLT 3 trimming of the balance outputs: one below dust is left
+       out and its value goes to the fee, so no zero or dust output is ever
+       signed.  The outputs that remain keep their order. */
+    if (ch->trim_dust_outputs) {
+        size_t w = 0;
+        for (size_t r = 0; r < out_idx; r++) {
+            if (r < 2 && outputs[r].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
+            if (w != r) outputs[w] = outputs[r];
+            w++;
+        }
+        out_idx = w;
+    }
+
     /* 8. Build unsigned tx (nVersion=3/TRUC: enables V3 penalty + CPFP chain) */
     if (!build_unsigned_tx_v(unsigned_tx_out, txid_out32,
                               ch->funding_txid, ch->funding_vout,
@@ -991,14 +1004,9 @@ int channel_build_commitment_tx(const channel_t *ch,
     return channel_build_commitment_tx_impl(ch, unsigned_tx_out, txid_out32, NULL);
 }
 
-int channel_build_commitment_tx_for_remote(const channel_t *ch,
-                                             tx_buf_t *unsigned_tx_out,
-                                             unsigned char *txid_out32) {
-    /* Get the remote's per-commitment point */
-    secp256k1_pubkey remote_pcp;
-    if (!channel_get_remote_pcp(ch, ch->commitment_number, &remote_pcp))
-        return 0;
-
+/* ch seen from the peer: amounts, basepoints and HTLC/PTLC directions
+   swapped.  The HTLC and PTLC arrays are copies the caller frees. */
+static int remote_view(const channel_t *ch, channel_t *out, htlc_t **htlc_out, ptlc_t **ptlc_out) {
     /* Create a copy with local/remote swapped to represent
        the remote party's view of their own commitment transaction.
        htlcs is a pointer (dynamic allocation), so we must copy the
@@ -1053,7 +1061,41 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
             rv.ptlcs[i].direction = PTLC_OFFERED;
     }
 
+    *out = rv;
+    *htlc_out = htlc_copy;
+    *ptlc_out = ptlc_copy;
+    return 1;
+}
+
+int channel_build_commitment_tx_for_remote(const channel_t *ch,
+                                             tx_buf_t *unsigned_tx_out,
+                                             unsigned char *txid_out32) {
+    /* Get the remote's per-commitment point */
+    secp256k1_pubkey remote_pcp;
+    if (!channel_get_remote_pcp(ch, ch->commitment_number, &remote_pcp))
+        return 0;
+
+    channel_t rv;
+    htlc_t *htlc_copy = NULL;
+    ptlc_t *ptlc_copy = NULL;
+    if (!remote_view(ch, &rv, &htlc_copy, &ptlc_copy)) return 0;
     int result = channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, &remote_pcp);
+    free(htlc_copy);
+    free(ptlc_copy);
+    return result;
+}
+
+int channel_build_commitment_at(const channel_t *ch, int for_remote,
+                                const secp256k1_pubkey *pcp,
+                                tx_buf_t *unsigned_tx_out, unsigned char *txid_out32) {
+    if (!ch || !pcp || !unsigned_tx_out) return 0;
+    if (!for_remote)
+        return channel_build_commitment_tx_impl(ch, unsigned_tx_out, txid_out32, pcp);
+    channel_t rv;
+    htlc_t *htlc_copy = NULL;
+    ptlc_t *ptlc_copy = NULL;
+    if (!remote_view(ch, &rv, &htlc_copy, &ptlc_copy)) return 0;
+    int result = channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, pcp);
     free(htlc_copy);
     free(ptlc_copy);
     return result;

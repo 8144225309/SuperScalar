@@ -133,6 +133,8 @@ typedef struct {
     uint64_t commit_fee_rate_sat_per_kvb;
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
+    int trim_dust_outputs;  /* 1 = the channel-update engine's commitments: balance
+                               outputs below dust are left out (BOLT 3) */
     int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
                              negotiated like option_anchors -- BOTH parties must set it
                              identically or the co-signed commitment sighash diverges.
@@ -344,6 +346,14 @@ int channel_build_commitment_tx(const channel_t *ch,
 int channel_build_commitment_tx_for_remote(const channel_t *ch,
                                              tx_buf_t *unsigned_tx_out,
                                              unsigned char *txid_out32);
+
+/* Build ch's own commitment (for_remote = 0) or the peer's (1) from ch's
+   balances and HTLCs, keyed by the holder's per-commitment point pcp.  The
+   P2A anchor, when on, comes from the funder's output (funder_is_local,
+   which the peer's view flips). */
+int channel_build_commitment_at(const channel_t *ch, int for_remote,
+                                const secp256k1_pubkey *pcp,
+                                tx_buf_t *unsigned_tx_out, unsigned char *txid_out32);
 
 int channel_sign_commitment(const channel_t *ch,
                               tx_buf_t *signed_tx_out,
