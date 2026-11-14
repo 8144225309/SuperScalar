@@ -3783,6 +3783,38 @@ static void run_unit_tests(void) {
     printf("\n=== Persistence Stress ===\n");
     RUN_TEST(test_persist_crash_stress);
     RUN_TEST(test_persist_crash_dw_state);
+
+    /* LSP restart / reconnect persistence */
+    extern int test_restart_lsp_revocation_persisted_after_restore(void);
+    RUN_TEST(test_restart_lsp_revocation_persisted_after_restore);
+    extern int test_restart_init_from_db_refuses_other_db(void);
+    RUN_TEST(test_restart_init_from_db_refuses_other_db);
+    extern int test_restart_channel_init_failure_owns_nothing(void);
+    RUN_TEST(test_restart_channel_init_failure_owns_nothing);
+    extern int test_restart_restore_failure_frees_mgr(void);
+    RUN_TEST(test_restart_restore_failure_frees_mgr);
+    extern int test_restart_reconnect_skips_settled_htlcs(void);
+    RUN_TEST(test_restart_reconnect_skips_settled_htlcs);
+    extern int test_restart_restore_more_than_64_htlcs(void);
+    RUN_TEST(test_restart_restore_more_than_64_htlcs);
+    extern int test_restart_restore_too_many_htlcs_fails_closed(void);
+    RUN_TEST(test_restart_restore_too_many_htlcs_fails_closed);
+    extern int test_restart_reconnect_rollback_more_than_64_htlcs(void);
+    RUN_TEST(test_restart_reconnect_rollback_more_than_64_htlcs);
+    extern int test_restart_reconnect_too_many_htlcs_fails_closed(void);
+    RUN_TEST(test_restart_reconnect_too_many_htlcs_fails_closed);
+    extern int test_restart_dw_state_read_error_fails_load(void);
+    RUN_TEST(test_restart_dw_state_read_error_fails_load);
+    extern int test_restart_dw_counter_restored_by_load_factory(void);
+    RUN_TEST(test_restart_dw_counter_restored_by_load_factory);
+    extern int test_restart_dw_counter_out_of_range_loads_exhausted(void);
+    RUN_TEST(test_restart_dw_counter_out_of_range_loads_exhausted);
+    extern int test_restart_dw_state_save_writes_current_state(void);
+    RUN_TEST(test_restart_dw_state_save_writes_current_state);
+    extern int test_restart_dw_counter_many_leaves_round_trip(void);
+    RUN_TEST(test_restart_dw_counter_many_leaves_round_trip);
+    extern int test_restart_client_reconnect_attaches_db(void);
+    RUN_TEST(test_restart_client_reconnect_attaches_db);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

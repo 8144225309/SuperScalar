@@ -1186,11 +1186,13 @@ int test_persist_dw_counter_round_trip(void) {
     TEST_ASSERT(persist_open(&db, NULL), "open");
 
     uint32_t layers[] = {3, 1};
-    TEST_ASSERT(persist_save_dw_counter(&db, 0, 7, 2, layers), "save dw counter");
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0, 7, 2, layers, 0, NULL, 0),
+                "save dw counter");
 
     uint32_t epoch, n_layers;
     uint32_t loaded_layers[8];
-    TEST_ASSERT(persist_load_dw_counter(&db, 0, &epoch, &n_layers, loaded_layers, 8),
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0, &epoch, &n_layers, loaded_layers, 8,
+                NULL, NULL, NULL, 0),
                 "load dw counter");
     TEST_ASSERT_EQ(epoch, 7, "epoch");
     TEST_ASSERT_EQ(n_layers, 2, "n_layers");
@@ -1199,8 +1201,10 @@ int test_persist_dw_counter_round_trip(void) {
 
     /* Overwrite with new epoch */
     uint32_t layers2[] = {4, 2, 0};
-    TEST_ASSERT(persist_save_dw_counter(&db, 0, 12, 3, layers2), "save dw counter 2");
-    TEST_ASSERT(persist_load_dw_counter(&db, 0, &epoch, &n_layers, loaded_layers, 8),
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0, 12, 3, layers2, 0, NULL, 0),
+                "save dw counter 2");
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0, &epoch, &n_layers, loaded_layers, 8,
+                NULL, NULL, NULL, 0),
                 "load dw counter 2");
     TEST_ASSERT_EQ(epoch, 12, "epoch 2");
     TEST_ASSERT_EQ(n_layers, 3, "n_layers 2");
@@ -1209,7 +1213,8 @@ int test_persist_dw_counter_round_trip(void) {
     TEST_ASSERT_EQ(loaded_layers[2], 0, "layer 2 v2");
 
     /* Non-existent factory */
-    TEST_ASSERT(!persist_load_dw_counter(&db, 99, &epoch, &n_layers, loaded_layers, 8),
+    TEST_ASSERT(!persist_load_dw_counter_with_leaves(&db, 99, &epoch, &n_layers, loaded_layers, 8,
+                NULL, NULL, NULL, 0),
                 "missing factory returns 0");
 
     persist_close(&db);

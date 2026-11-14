@@ -3232,20 +3232,10 @@ int main(int argc, char *argv[]) {
                        "(seed re-derived deterministically from LSP key)\n");
             }
 
-            /* Load DW counter state from DB */
-            {
-                uint32_t epoch_out, n_layers_out;
-                uint32_t layer_states_out[DW_MAX_LAYERS];
-                if (persist_load_dw_counter(&db, 0, &epoch_out, &n_layers_out,
-                                              layer_states_out, DW_MAX_LAYERS)) {
-                    for (uint32_t li = 0; li < n_layers_out &&
-                         li < lsp_rp->factory.counter.n_layers; li++)
-                        lsp_rp->factory.counter.layers[li].current_state =
-                            layer_states_out[li];
-                    printf("LSP recovery: DW counter loaded (epoch %u)\n",
-                           dw_counter_epoch(&lsp_rp->factory.counter));
-                }
-            }
+            /* persist_load_factory restored the DW counter (layer states,
+               epoch, per-leaf states) from dw_counter_state. */
+            printf("LSP recovery: DW counter at epoch %u\n",
+                   dw_counter_epoch(&lsp_rp->factory.counter));
 
             /* The factory keeps the lifecycle it was created with (its expiry
                does not move on a restart); one with none recorded starts
@@ -3266,6 +3256,10 @@ int main(int argc, char *argv[]) {
             if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_rp); return 1; }
             g_channel_mgr = mgr;
             mgr->fee = fee_est;
+            /* Before init: lsp_channels_init_from_db attaches it to every
+               restored channel, so revocations and remote PCPs received
+               after the restart are written to the DB. */
+            mgr->persist = &db;
             if (!lsp_channels_init_from_db(mgr, ctx, &lsp_rp->factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
@@ -3276,7 +3270,6 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            mgr->persist = &db;
             mgr->confirm_timeout_secs = confirm_timeout_secs;
             mgr->heartbeat_interval = heartbeat_interval;
 
@@ -4514,12 +4507,9 @@ accept_new_factory:
                 fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
                 init_ok = 0;
             }
-            if (init_ok) {
-                /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-                uint32_t init_layers[DW_MAX_LAYERS] = {0};
-                for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
-                    init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
-                persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
+            if (init_ok && !persist_save_factory_dw_state(&db, 0, &lsp_p->factory)) {
+                fprintf(stderr, "LSP: warning: failed to persist DW counter\n");
+                init_ok = 0;
             }
             if (init_ok) {
                 /* Save ladder factory state (Tier 2) */
@@ -4883,14 +4873,9 @@ accept_new_factory:
                     printf(" L%u=%u", li, d);
                 }
                 printf(" blocks)\n");
-                if (use_db) {
-                    uint32_t layer_states[DW_MAX_LAYERS] = {0};
-                    for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
-                        layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
-                    persist_save_dw_counter(&db, 0, epoch,
-                                             lsp_p->factory.counter.n_layers,
-                                             layer_states);
-                }
+                if (use_db &&
+                    !persist_save_factory_dw_state(&db, 0, &lsp_p->factory))
+                    fprintf(stderr, "LSP: warning: failed to persist DW counter\n");
             }
         }
         channels_active = 1;

@@ -265,6 +265,8 @@ int channel_derive_revocation_privkey(const secp256k1_context *ctx,
 
 /* --- Channel lifecycle --- */
 
+/* On failure ch owns nothing (its arrays are freed and NULL): calling
+   channel_cleanup on it is safe and not needed. */
 int channel_init(channel_t *ch, secp256k1_context *ctx,
                   const unsigned char *local_funding_secret32,
                   const secp256k1_pubkey *local_funding_pubkey,
@@ -525,6 +527,12 @@ size_t channel_commit_htlc_outputs(const channel_t *ch);
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out);
+
+/* Grow ch->htlcs so it holds at least n entries; contents are kept.
+   Returns 0 (array unchanged) if n > MAX_HTLCS or the allocation fails.
+   For code that fills the array directly instead of via channel_add_htlc
+   (restoring HTLCs from the DB). */
+int channel_reserve_htlcs(channel_t *ch, size_t n);
 
 int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
                            const unsigned char *preimage32);

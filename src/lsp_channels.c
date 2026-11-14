@@ -2606,24 +2606,10 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 node->signed_tx.data, node->signed_tx.len,
                 node->outputs[0].amount_sats,
                 /* poison_tx */ poison_snapshot, poison_snapshot_len);
-        } else {
-            /* One entry per leaf: n_leaf_nodes is not bounded by a small
-               constant (a fixed [8] array overflowed past 8 leaves). */
-            uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
-                                           sizeof(uint32_t));
-            for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
-                leaf_states[i] = f->leaf_layers[i].current_state;
-            uint32_t layer_states[DW_MAX_LAYERS] = {0};
-            for (uint32_t i = 0; i < f->counter.n_layers; i++)
-                layer_states[i] = f->counter.layers[i].config.max_states;
-            if (leaf_states)
-                persist_save_dw_counter_with_leaves(
-                    (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-                    f->counter.n_layers, layer_states,
-                    f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
-            else
-                fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
-            free(leaf_states);
+        } else if (!persist_save_factory_dw_state((persist_t *)mgr->persist,
+                                                  0, f)) {
+            fprintf(stderr, "LSP-stateless: failed to persist DW state after "
+                    "leaf %d advance\n", leaf_side);
         }
     }
 
@@ -3361,6 +3347,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
                    saved);
     }
+
+    /* The ceremony moved the root layer and epoch on (and reset the leaf
+       layers); persist that so a restart resumes from this state. */
+    if (mgr->persist &&
+        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
+        fprintf(stderr, "LSP-stateless Tier B: failed to persist DW state\n");
 
     /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
     if (mgr->persist && c3_round_id > 0) {
@@ -4533,24 +4525,10 @@ static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     cJSON_Delete(done);
 
     /* Step 14: Persist per-leaf DW state */
-    if (mgr->persist) {
-        /* One entry per leaf (a fixed [8] array overflowed past 8 leaves). */
-        uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
-                                       sizeof(uint32_t));
-        for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
-            leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS] = {0};
-        for (uint32_t i = 0; i < f->counter.n_layers; i++)
-            layer_states[i] = f->counter.layers[i].config.max_states;
-        if (leaf_states)
-            persist_save_dw_counter_with_leaves(
-                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-                f->counter.n_layers, layer_states,
-                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
-        else
-            fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
-        free(leaf_states);
-    }
+    if (mgr->persist &&
+        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
+        fprintf(stderr, "LSP: failed to persist DW state after leaf %d "
+                "realloc\n", leaf_side);
 
     printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
     for (size_t i = 0; i < n_amounts; i++)
@@ -6903,31 +6881,36 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                Roll back to last committed state from persistence. */
             uint64_t db_local, db_remote, db_cn;
             if (persist_load_channel_state((persist_t *)mgr->persist,
-                    (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                    (uint32_t)c, &db_local, &db_remote, &db_cn) &&
+                persist_load_channel_htlcs((persist_t *)mgr->persist,
+                    (uint32_t)c, ch) >= 0) {
                 ch->local_amount = db_local;
                 ch->remote_amount = db_remote;
                 ch->commitment_number = db_cn;
-                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
-                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
                 printf("LSP: rolled back channel %zu to committed state "
                        "(cn=%llu)\n", c, (unsigned long long)db_cn);
             } else {
-                fprintf(stderr, "LSP: rollback failed — no DB state for %zu\n", c);
+                fprintf(stderr, "LSP: rollback failed — no usable DB state for %zu\n", c);
                 wire_close(new_fd);
                 return 0;
             }
         } else if (diff == -1 && mgr->persist) {
             /* Client is 1 ahead: LSP crashed after client committed but
                before LSP persisted. Accept client's commitment_number. */
-            ch->commitment_number = commitment_number;
             uint64_t db_local, db_remote, db_cn;
             if (persist_load_channel_state((persist_t *)mgr->persist,
                     (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                if (persist_load_channel_htlcs((persist_t *)mgr->persist,
+                        (uint32_t)c, ch) < 0) {
+                    fprintf(stderr, "LSP reconnect: cannot restore HTLCs for "
+                            "slot %zu — closing connection\n", c);
+                    wire_close(new_fd);
+                    return 0;
+                }
                 ch->local_amount = db_local;
                 ch->remote_amount = db_remote;
-                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
-                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
             }
+            ch->commitment_number = commitment_number;
             printf("LSP: accepted client %zu commitment_number %llu "
                    "(LSP was behind)\n", c, (unsigned long long)commitment_number);
         } else {
