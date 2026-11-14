@@ -482,6 +482,16 @@ static int persist_table_has_column(sqlite3 *db, const char *table,
     return found;
 }
 
+/* Add a column to a table if it does not have it yet.  Returns 1 if the
+   column is there afterwards. */
+static int persist_ensure_column(sqlite3 *db, const char *table,
+                                 const char *col, const char *decl) {
+    if (persist_table_has_column(db, table, col)) return 1;
+    char sql[256];
+    snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;", table, col, decl);
+    return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+}
+
 int persist_open(persist_t *p, const char *path) {
     if (!p) return 0;
     memset(p, 0, sizeof(*p));
@@ -1585,6 +1595,37 @@ int persist_open(persist_t *p, const char *path) {
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
+        }
+    }
+
+    /* v45: on-chain HTLC-success claims ride in pending_sweeps.  They carry
+       what is needed to rebuild the claim after a restart, once the HTLC
+       itself is gone from channel state: the preimage, the HTLC script and
+       the per-commitment point of the commitment holding it.  Each column
+       is added whenever it is missing, whatever version the database is
+       stamped with, so the step is correct in any order relative to other
+       schema changes; if one cannot be added the open fails and the
+       version is not recorded. */
+    {
+        static const char *const claim_cols[][2] = {
+            { "claim_side",   "INTEGER NOT NULL DEFAULT 0" },
+            { "payment_hash", "TEXT NOT NULL DEFAULT ''" },
+            { "preimage",     "TEXT NOT NULL DEFAULT ''" },
+            { "cltv_expiry",  "INTEGER NOT NULL DEFAULT 0" },
+            { "htlc_spk",     "TEXT NOT NULL DEFAULT ''" },
+            { "commit_point", "TEXT NOT NULL DEFAULT ''" },
+            { "claim_amount", "INTEGER NOT NULL DEFAULT 0" },
+        };
+        for (size_t k = 0; k < sizeof(claim_cols) / sizeof(claim_cols[0]); k++) {
+            if (!persist_ensure_column(p->db, "pending_sweeps",
+                                       claim_cols[k][0], claim_cols[k][1])) {
+                fprintf(stderr, "persist_open: migration v45 (pending_sweeps "
+                        "column %s) failed: %s\n", claim_cols[k][0],
+                        sqlite3_errmsg(p->db));
+                sqlite3_close(p->db);
+                p->db = NULL;
+                return 0;
+            }
         }
     }
 

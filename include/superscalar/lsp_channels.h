@@ -783,9 +783,31 @@ int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    sends MSG_RECONNECT_ACK. Returns 1 on success. */
 int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd);
 
-/* Detect commitment TXs on-chain and register to_local outputs with the
-   sweeper for CSV-delayed sweep. Called from daemon loop. */
-int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr);
+/* On-chain HTLC-success claims (BOLT #5).  mgr->sweeper, when set, claims
+   HTLCs a client offered us whose preimage we revealed, if the client puts
+   a commitment still holding them on chain.
+   lsp_channels_attach_sweeper: point the sweeper's channel lookup at mgr
+   and install it as mgr->sweeper.
+   lsp_channels_register_htlc_claim: call before revealing the preimage of
+   HTLC htlc_id (still ACTIVE) on channel idx.  Returns 1 if registered
+   (the claim is on disk), 0 if there is nothing to claim on chain, -1 on
+   error (also logged): the preimage must then not be revealed to idx.
+   lsp_channels_register_sender_claims: the same for every HTLC with this
+   preimage's hash that a client other than payee_idx offered us (the
+   senders a fulfil is about to be propagated back to).  Returns the
+   number registered.
+   lsp_channels_cancel_htlc_claims: call once the client's commitment
+   old_cn is validly revoked; only claims on that commitment are dropped.
+   sweeper is a sweeper_t* (void* as mgr->sweeper). */
+int lsp_channels_attach_sweeper(lsp_channel_mgr_t *mgr, void *sweeper);
+int lsp_channels_register_htlc_claim(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t htlc_id,
+                                     const unsigned char *preimage32);
+int lsp_channels_register_sender_claims(lsp_channel_mgr_t *mgr,
+                                        size_t payee_idx,
+                                        const unsigned char *preimage32);
+void lsp_channels_cancel_htlc_claims(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t old_cn);
 
 /* Balance conservation invariant check.
    Verifies sum(local + remote + active_htlcs + active_ptlcs) == funding_amount
@@ -832,11 +854,14 @@ int lsp_channels_recv_client_reply(int fd, wire_msg_t *msg, uint8_t expected,
    Returns 1 when the exchange completed.  If it did not, the client's
    connection is dropped, so nothing further happens on a channel whose
    commitment is in doubt until the client reconnects and the pending
-   commitment is sent again. */
+   commitment is sent again.  With missing_is_fatal (a fulfil: the client
+   has the preimage) an exchange that does not complete fails the channel
+   instead, since the client may keep the commitment it replaced. */
 int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      size_t client_idx,
                                      uint64_t old_local, uint64_t old_remote,
-                                     const htlc_t *old_htlcs, size_t old_n_htlcs);
+                                     const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                     int missing_is_fatal);
 
 /* Give a client back the HTLC it offered for an outside payment that was
    never requested from the Lightning node, and close its origin.  The HTLC

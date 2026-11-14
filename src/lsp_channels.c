@@ -175,6 +175,26 @@ int lsp_channels_client_failed(lsp_channel_mgr_t *mgr, size_t client_idx) {
     return jit && jit->channel.revocation_failed;
 }
 
+int lsp_channels_watch_commitment(lsp_channel_mgr_t *mgr, size_t client_idx) {
+    if (!mgr || !mgr->sweeper || !mgr->entries || client_idx >= mgr->n_channels)
+        return 1;
+    const channel_t *ch = &mgr->entries[client_idx].channel;
+    int ok = 1;
+    for (size_t h = 0; h < ch->n_htlcs; h++) {
+        if (ch->htlcs[h].state != HTLC_STATE_ACTIVE ||
+            ch->htlcs[h].direction != HTLC_RECEIVED)
+            continue;
+        if (sweeper_watch_htlc((sweeper_t *)mgr->sweeper, ch,
+                               (uint32_t)client_idx, 0, ch->htlcs[h].id) < 0)
+            ok = 0;
+    }
+    if (!ok)
+        fprintf(stderr, "LSP: ALERT: could not watch the HTLCs on client "
+                "%zu's commitment %llu before replacing it\n", client_idx,
+                (unsigned long long)ch->commitment_number);
+    return ok;
+}
+
 int (lsp_channels_accept_revocation)(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      size_t client_idx, channel_t *ch,
                                      const cJSON *raa_json,
@@ -225,6 +245,13 @@ int (lsp_channels_accept_revocation)(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_channels_fail_channel(mgr, lsp, client_idx, ch, 1, why);
         return 0;
     }
+    /* Commitment old_cn is now validly revoked: broadcasting it is a
+       breach, which the penalty path covers, so the HTLC-success claims
+       armed on it are no longer needed.  Only a revocation that verified
+       gets here; a garbled one leaves them armed. */
+    if (mgr->entries && client_idx < mgr->n_channels &&
+        ch == &mgr->entries[client_idx].channel)
+        lsp_channels_cancel_htlc_claims(mgr, client_idx, old_cn);
     if (old_cn_out) *old_cn_out = old_cn;
     if (next_pcp_out) *next_pcp_out = next_pcp;
     return 1;
@@ -1415,6 +1442,19 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (old_sender_n_ptlcs > 0)
         memcpy(old_sender_ptlcs, sender_ch->ptlcs, old_sender_n_ptlcs * sizeof(ptlc_t));
 
+    /* The sender may never revoke the commitment this add replaces: watch
+       the HTLCs on it first, so that a preimage learned later is claimed
+       there too.  If they cannot be watched the HTLC is not taken. */
+    if (!lsp_channels_watch_commitment(mgr, sender_idx)) {
+        cJSON *fail = wire_build_update_fail_htlc_uncommitted(htlc_id,
+                                                               "temporary failure");
+        wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
+        cJSON_Delete(fail);
+        free(old_sender_htlcs);
+        free(old_sender_ptlcs);
+        return 1;
+    }
+
     /* Add HTLC to sender's channel (offered from client = received by LSP) */
     uint64_t new_htlc_id;
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
@@ -1687,9 +1727,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Add HTLC to destination's channel (offered from LSP) */
+    /* Add HTLC to destination's channel (offered from LSP).  First watch
+       the HTLCs on the commitment this add replaces, in case the
+       destination never revokes it; without the watch the add is not
+       made. */
     uint64_t dest_htlc_id;
-    if (!channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
+    if (!(dest_is_jit || lsp_channels_watch_commitment(mgr, dest_idx)) ||
+        !channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
                            payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
         /* The payer's HTLC is already in its commitment: give it back, with
            the commitment exchange, and do not count the routing fee. */
@@ -5908,6 +5952,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (old_ch_n_htlcs > 0)
         memcpy(old_ch_htlcs, ch->htlcs, old_ch_n_htlcs * sizeof(htlc_t));
 
+    /* The payee may never revoke the commitment this fulfil replaces: watch
+       the HTLCs it offered us there first.  Best effort: the preimage is
+       ours either way, and it still settles the payment upstream. */
+    lsp_channels_watch_commitment(mgr, client_idx);
+
     /* Fulfill the HTLC on this channel (LSP offered → client fulfills) */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage)) {
         fprintf(stderr, "LSP: fulfill_htlc failed for client %zu htlc %llu\n",
@@ -5916,56 +5965,57 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
+    /* From here the preimage is known and the HTLC is settled on the
+       payee's channel, so the payment is fulfilled upstream whatever the
+       payee does next.  payee_ok is 0 once its commitment exchange did not
+       complete. */
+    int payee_ok = 1;
+
     /* Send COMMITMENT_SIGNED to this client (real partial sig) */
     {
         unsigned char psig32[32];
         uint32_t nonce_idx;
         if (!channel_create_commitment_partial_sig(ch, psig32, &nonce_idx)) {
             fprintf(stderr, "LSP: create partial sig failed for client %zu\n", client_idx);
-            free(old_ch_htlcs);
-            return 0;
-        }
-        cJSON *cs = wire_build_commitment_signed(
-            mgr->entries[client_idx].channel_id,
-            ch->commitment_number, psig32, nonce_idx);
-        if (!wire_send(lsp->client_fds[client_idx], MSG_COMMITMENT_SIGNED, cs)) {
-            cJSON_Delete(cs);
-            free(old_ch_htlcs);
-            return 0;
-        }
-        cJSON_Delete(cs);
-        /* Fix 5: flag pending CS so reconnect can retransmit if RAA lost */
-        if (mgr->persist)
-            persist_save_pending_cs((persist_t *)mgr->persist,
+            payee_ok = 0;
+        } else {
+            cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[client_idx].channel_id,
-                ch->commitment_number);
+                ch->commitment_number, psig32, nonce_idx);
+            if (!wire_send(lsp->client_fds[client_idx], MSG_COMMITMENT_SIGNED, cs))
+                payee_ok = 0;
+            cJSON_Delete(cs);
+            /* Fix 5: flag pending CS so reconnect can retransmit if RAA lost */
+            if (payee_ok && mgr->persist)
+                persist_save_pending_cs((persist_t *)mgr->persist,
+                    mgr->entries[client_idx].channel_id,
+                    ch->commitment_number);
+        }
     }
 
-    /* Wait for REVOKE_AND_ACK */
-    int payee_ok = 1;   /* 0 once the payee's revocation failed (channel failed) */
-    {
+    /* Wait for REVOKE_AND_ACK.  Without one, or with one that does not
+       verify, the channel fails: the payee keeps a commitment it never
+       revoked, so nothing more is signed for it.  The flow continues: the
+       LSP already holds the preimage, so recording the fulfil and settling
+       upstream only collects what it is owed. */
+    if (payee_ok) {
         wire_msg_t ack_msg;
+        uint64_t old_cn;
         if (!recv_expected_drain_stray(mgr, lsp, lsp->client_fds[client_idx],
                                         &ack_msg, MSG_REVOKE_AND_ACK, 30, client_idx)) {
-            if (ack_msg.json) cJSON_Delete(ack_msg.json);
-            free(old_ch_htlcs);
-            return 0;
-        }
-        /* Fail-closed: if the revocation does not verify, or the commitment
-           it revokes cannot be watched, the channel is failed (no watch,
-           no LSP revocation).  The flow continues: the LSP already holds
-           the preimage, so recording the fulfil and settling upstream
-           only collects what it is owed. */
-        uint64_t old_cn;
-        if (lsp_channels_accept_raa(mgr, lsp, client_idx, ch,
+            lsp_channels_fail_channel(mgr, lsp, client_idx, ch, 1,
+                "no revoke_and_ack after a fulfil");
+            payee_ok = 0;
+        } else if (lsp_channels_accept_raa(mgr, lsp, client_idx, ch,
                 (uint32_t)client_idx, ack_msg.json,
                 old_ch_local, old_ch_remote,
                 old_ch_htlcs, old_ch_n_htlcs,
-                ch->ptlcs, ch->n_ptlcs, &old_cn, NULL))
+                ch->ptlcs, ch->n_ptlcs, &old_cn, NULL)) {
             lsp_send_revocation(mgr, lsp, client_idx, old_cn);
-        else
+        } else {
             payee_ok = 0;
-        cJSON_Delete(ack_msg.json);
+        }
+        if (ack_msg.json) cJSON_Delete(ack_msg.json);
     }
     free(old_ch_htlcs);
 
@@ -5989,6 +6039,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        persisted (or bridge propagation completes), so the two balance
        updates are atomic.  If the LSP crashes between payee credit and
        sender debit, the DB rolls back both. */
+    /* Once a sender sees the preimage it may withhold its revoke_and_ack and
+       broadcast the commitment that still holds its HTLC.  Arm the on-chain
+       claim for every such HTLC before the preimage goes out, and before the
+       transaction below opens: a claim is only registered once its row is
+       on disk.  A sender whose claim could not be armed is not sent the
+       preimage (see the loop below). */
+    lsp_channels_register_sender_claims(mgr, client_idx, preimage);
+
     int fulfill_txn_started = 0;
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
@@ -6042,7 +6100,31 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (htlc->direction != HTLC_RECEIVED) continue;
             if (memcmp(htlc->payment_hash, payment_hash, 32) != 0) continue;
 
-            /* Found it — fulfill on sender's channel */
+            /* Found it — fulfill on sender's channel, but only once the
+               on-chain claim of this HTLC is on disk.  It was registered
+               before the transaction above opened; this call finds it and
+               writes nothing.  Without it the sender could take the
+               preimage, withhold its revoke_and_ack and time the HTLC out
+               on chain. */
+            if (lsp_channels_register_htlc_claim(mgr, s, htlc->id,
+                                                 preimage) < 0) {
+                fprintf(stderr, "LSP: CRITICAL: no on-chain claim for HTLC "
+                        "%llu of client %zu: its preimage is not revealed, "
+                        "the channel must be closed on chain\n",
+                        (unsigned long long)htlc->id, s);
+                continue;
+            }
+            /* A failed channel gets no preimage: the HTLC is claimed on
+               chain from whichever commitment the sender broadcasts. */
+            if (sender_ch->revocation_failed) {
+                fprintf(stderr, "LSP: client %zu channel failed: preimage of "
+                        "HTLC %llu not revealed to it, claimed on chain if "
+                        "it broadcasts\n", s, (unsigned long long)htlc->id);
+                break;
+            }
+            /* htlc points into sender_ch->htlcs, which the fulfil compacts. */
+            uint64_t sender_htlc_id = htlc->id;
+            uint64_t sender_htlc_amount = htlc->amount_sats;
             uint64_t old_sender_local = sender_ch->local_amount;
             uint64_t old_sender_remote = sender_ch->remote_amount;
             size_t old_sender_n_htlcs = sender_ch->n_htlcs;
@@ -6051,37 +6133,44 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (old_sender_n_htlcs > 0 && !old_sender_htlcs) continue;
             if (old_sender_n_htlcs > 0)
                 memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
-            if (!channel_fulfill_htlc(sender_ch, htlc->id, preimage)) {
+            if (!channel_fulfill_htlc(sender_ch, sender_htlc_id, preimage)) {
                 fprintf(stderr, "LSP: back-fulfill failed\n");
                 free(old_sender_htlcs);
                 continue;
             }
 
             /* Send FULFILL_HTLC to sender */
-            cJSON *fwd = wire_build_update_fulfill_htlc(htlc->id, preimage);
+            cJSON *fwd = wire_build_update_fulfill_htlc(sender_htlc_id, preimage);
             wire_send(lsp->client_fds[s], MSG_UPDATE_FULFILL_HTLC, fwd);
             cJSON_Delete(fwd);
 
-            /* Send COMMITMENT_SIGNED (real partial sig) */
+            /* The sender has the preimage now.  Unless it revokes the
+               commitment the fulfil replaces, with a revocation that
+               verifies, its channel fails: that commitment still holds
+               the HTLC (claimed on chain if broadcast) and HTLCs watched
+               on it, and nothing more is signed or revealed for it.  Only
+               a verified revocation retires the claim. */
+            int sent_cs = 0;
             {
                 unsigned char psig32[32];
                 uint32_t nonce_idx;
-                if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+                if (channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+                    cJSON *cs = wire_build_commitment_signed(
+                        mgr->entries[s].channel_id,
+                        sender_ch->commitment_number, psig32, nonce_idx);
+                    sent_cs = wire_send(lsp->client_fds[s], MSG_COMMITMENT_SIGNED, cs);
+                    cJSON_Delete(cs);
+                } else {
                     fprintf(stderr, "LSP: create partial sig failed for back-propagation to %zu\n", s);
-                    free(old_sender_htlcs);
-                    continue;
                 }
-                cJSON *cs = wire_build_commitment_signed(
-                    mgr->entries[s].channel_id,
-                    sender_ch->commitment_number, psig32, nonce_idx);
-                wire_send(lsp->client_fds[s], MSG_COMMITMENT_SIGNED, cs);
-                cJSON_Delete(cs);
             }
 
             /* Wait for REVOKE_AND_ACK */
             wire_msg_t ack_msg;
-            if (recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[s], &ack_msg, 30) &&
-                ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
+            memset(&ack_msg, 0, sizeof(ack_msg));
+            if (sent_cs &&
+                recv_expected_drain_stray(mgr, lsp, lsp->client_fds[s], &ack_msg,
+                                          MSG_REVOKE_AND_ACK, 30, s)) {
                 /* Fail-closed: if the revocation does not verify, or the commitment
                    it revokes cannot be watched, the channel is failed (no watch,
                    no LSP revocation).  The flow continues: the LSP already holds
@@ -6094,6 +6183,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         old_sender_htlcs, old_sender_n_htlcs,
                         sender_ch->ptlcs, sender_ch->n_ptlcs, &old_cn, NULL))
                     lsp_send_revocation(mgr, lsp, s, old_cn);
+            } else {
+                lsp_channels_fail_channel(mgr, lsp, s, sender_ch, sent_cs,
+                    "no revoke_and_ack after a fulfil");
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
             free(old_sender_htlcs);
@@ -6106,7 +6198,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     (uint32_t)s,
                     sender_ch->local_amount, sender_ch->remote_amount,
                     sender_ch->commitment_number);
-                persist_delete_htlc(db, (uint32_t)s, htlc->id);
+                persist_delete_htlc(db, (uint32_t)s, sender_htlc_id);
                 /* Commit the atomic payee+sender transaction */
                 if (fulfill_txn_started)
                     persist_commit(db);
@@ -6114,7 +6206,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
-                   s, client_idx, (unsigned long long)htlc->amount_sats);
+                   s, client_idx, (unsigned long long)sender_htlc_amount);
             break;
         }
     }
@@ -8630,9 +8722,6 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (!lsp_channels_check_conservation(mgr))
                         fprintf(stderr, "LSP: ALERT — balance conservation "
                                 "violated, refusing new HTLCs\n");
-                    /* Detect commitment TXs on-chain and register sweeps */
-                    if (mgr->sweeper)
-                        lsp_channels_detect_commitment_sweeps(mgr);
                     /* Run sweeper on same cycle */
                     if (mgr->sweeper)
                         sweeper_check((sweeper_t *)mgr->sweeper);
@@ -9006,84 +9095,91 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Demo mode + payment initiation moved to lsp_demo.c */
 
 /* ------------------------------------------------------------------ */
-/* Auto-sweep outputs after force-close                                 */
+/* On-chain HTLC-success claims                                         */
 /* ------------------------------------------------------------------ */
 
-/*
- * Detect commitment TXs on-chain and register to_local outputs with the
- * sweeper for CSV-delayed sweep.
- *
- * After a force-close, the client broadcasts their commitment TX (they hold
- * the fully-signed MuSig2 version). The LSP detects the commitment TX on
- * chain and sweeps the to_local output after the CSV delay.
- *
- * Called from the daemon loop alongside watchtower_check().
- */
-int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr)
+static channel_t *lsp_sweeper_get_channel(void *arg, uint32_t channel_id)
 {
-    extern void hex_encode(const unsigned char *, size_t, char *);
-    extern void reverse_bytes(unsigned char *, size_t);
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)arg;
+    if (!mgr || channel_id >= mgr->n_channels) return NULL;
+    return &mgr->entries[channel_id].channel;
+}
 
-    if (!mgr || !mgr->watchtower || !mgr->sweeper) return 0;
+int lsp_channels_attach_sweeper(lsp_channel_mgr_t *mgr, void *sweeper)
+{
+    if (!mgr || !sweeper) return 0;
+    sweeper_set_channel_lookup((sweeper_t *)sweeper, lsp_sweeper_get_channel,
+                               mgr);
+    mgr->sweeper = sweeper;
+    return 1;
+}
 
-    chain_backend_t *chain = mgr->watchtower->chain;
-    sweeper_t *sw = (sweeper_t *)mgr->sweeper;
-    if (!chain) return 0;
+int lsp_channels_register_htlc_claim(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t htlc_id,
+                                     const unsigned char *preimage32)
+{
+    if (!mgr || !mgr->sweeper || idx >= mgr->n_channels) return 0;
+    /* The client holds its own commitment signed, so that is the one it can
+       broadcast with this HTLC still in it; a commitment it never revoked
+       may hold it too, and was watched before it was replaced: arm that
+       claim as well. */
+    int r = sweeper_supply_preimage((sweeper_t *)mgr->sweeper, (uint32_t)idx,
+                                    preimage32) < 0 ? -1 : 0;
+    if (r == 0)
+        r = sweeper_add_htlc_success((sweeper_t *)mgr->sweeper,
+                                     &mgr->entries[idx].channel,
+                                     (uint32_t)idx, 0,
+                                     HTLC_CLAIM_REMOTE_COMMIT, htlc_id,
+                                     preimage32);
+    if (r < 0)
+        fprintf(stderr, "LSP: ALERT — could not register on-chain claim for "
+                "HTLC %llu on channel %zu before revealing its preimage\n",
+                (unsigned long long)htlc_id, idx);
+    return r;
+}
 
-    int n_registered = 0;
-
-    for (size_t c = 0; c < mgr->n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        if (ch->funding_amount == 0) continue;
-
-        /* Build the expected commitment TX to get its txid */
-        tx_buf_t unsigned_tx;
-        tx_buf_init(&unsigned_tx, 512);
-        unsigned char commit_txid[32];
-        if (!channel_build_commitment_tx(ch, &unsigned_tx, commit_txid)) {
-            tx_buf_free(&unsigned_tx);
-            continue;
-        }
-        tx_buf_free(&unsigned_tx);
-
-        /* Check if this commitment TX is on-chain */
-        unsigned char display_txid[32];
-        memcpy(display_txid, commit_txid, 32);
-        reverse_bytes(display_txid, 32);
-        char txid_hex[65];
-        hex_encode(display_txid, 32, txid_hex);
-
-        int confs = chain->get_confirmations(chain, txid_hex);
-        if (confs < 1) continue;  /* Not confirmed yet */
-
-        /* Check if we already registered a sweep for this output */
-        int already = 0;
-        for (size_t s = 0; s < sw->n_entries; s++) {
-            if (memcmp(sw->entries[s].source_txid, commit_txid, 32) == 0 &&
-                sw->entries[s].type == SWEEP_TO_LOCAL) {
-                already = 1;
-                break;
+int lsp_channels_register_sender_claims(lsp_channel_mgr_t *mgr,
+                                        size_t payee_idx,
+                                        const unsigned char *preimage32)
+{
+    if (!mgr || !mgr->sweeper || !preimage32) return 0;
+    unsigned char hash[32];
+    sha256(preimage32, 32, hash);
+    int n = 0;
+    for (size_t s = 0; s < mgr->n_channels; s++) {
+        if (s == payee_idx) continue;
+        channel_t *sc = &mgr->entries[s].channel;
+        int watched = sc->revocation_failed;    /* failed: no new commitment */
+        for (size_t h = 0; h < sc->n_htlcs; h++) {
+            if (sc->htlcs[h].state != HTLC_STATE_ACTIVE ||
+                sc->htlcs[h].direction != HTLC_RECEIVED ||
+                memcmp(sc->htlcs[h].payment_hash, hash, 32) != 0)
+                continue;
+            /* The fulfil replaces this commitment; the sender may never
+               revoke it, so its other HTLCs are watched first.  A sender
+               whose commitment cannot be watched is not updated. */
+            if (!watched) {
+                if (!lsp_channels_watch_commitment(mgr, s)) {
+                    lsp_channels_fail_channel(mgr, NULL, s, sc, 0,
+                        "its commitment could not be watched");
+                    break;
+                }
+                watched = 1;
             }
-        }
-        if (already) continue;
-
-        /* Register to_local output (vout 0) for CSV-delayed sweep.
-           The to_local output has a CSV delay of to_self_delay blocks. */
-        if (ch->local_amount >= CHANNEL_DUST_LIMIT_SATS) {
-            sweeper_add(sw, SWEEP_TO_LOCAL,
-                        commit_txid, 0, ch->local_amount,
-                        ch->to_self_delay,
-                        (uint32_t)c, 0, ch->commitment_number);
-            printf("LSP sweeper: channel %zu — commitment confirmed, "
-                   "registered to_local sweep (%llu sats, CSV %u)\n",
-                   c, (unsigned long long)ch->local_amount,
-                   ch->to_self_delay);
-            fflush(stdout);
-            n_registered++;
+            if (lsp_channels_register_htlc_claim(mgr, s, sc->htlcs[h].id,
+                                                 preimage32) == 1)
+                n++;
         }
     }
+    return n;
+}
 
-    return n_registered;
+void lsp_channels_cancel_htlc_claims(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t old_cn)
+{
+    if (!mgr || !mgr->sweeper) return;
+    sweeper_cancel_htlc_success((sweeper_t *)mgr->sweeper, (uint32_t)idx,
+                                old_cn);
 }
 
 /* ------------------------------------------------------------------ */

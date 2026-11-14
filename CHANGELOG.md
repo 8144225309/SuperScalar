@@ -2,7 +2,7 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **42**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **45**.
 
 ## Unreleased
 
@@ -10,6 +10,15 @@ All notable changes to SuperScalar are documented here.
 
 - **Invalid revocations fail the channel.** A peer could answer a commitment update with a revocation that does not verify and keep an older commitment that can never be penalised. Such a revocation now fails the channel: nothing on it is watched, revealed or forwarded, the peer is disconnected and refused, and the failure is persisted unless it arrived on a session opened by a reconnect; the client applies its `--on-lsp-forgery` policy to an LSP revocation that does not verify.
 - **Every revoked commitment is watched.** Revoked commitments beyond the watchtower's first 128 were dropped silently, so a breach of one went unpunished. The watch table now grows as needed and is fully reloaded on restart, and a revoked commitment that cannot be watched fails the channel.
+
+### HTLCs are claimed on chain with the preimage before they can be timed out
+
+Schema v45 (`pending_sweeps` claim columns).
+
+- **On-chain HTLC-success claims.** Nothing spent an HTLC output through its success leaf, so a sender that had received the preimage could withhold its `revoke_and_ack`, broadcast the commitment still holding the HTLC and take it back through the timeout path after the CLTV. `channel_build_htlc_claim_tx` builds the claim from either commitment (the received-HTLC leaf with the `to_self_delay` CSV on our own, the offered-HTLC leaf without CSV on the counterparty's), and the sweeper broadcasts it once that commitment confirms, rebroadcasts it until it is buried, then sweeps its output. Claims persist across a restart (preimages sealed at rest) and are found by their HTLC outpoint, without block scans.
+- **A claim is armed before a preimage is revealed.** The LSP registers it before a fulfil goes back to a sender client (intra-factory forwards and bridge pay results); the client registers one on its own signed commitment before it fulfils. A claim that cannot be written to disk means the preimage is not revealed. Only a revocation that verifies retires a claim, and only on the commitment it revokes. The client runs its claims from its DB while the LSP is unreachable, after a restart and on `--force-close`.
+- **A client that does not revoke after a fulfil fails its channel.** Before an update replaces a client's commitment, the HTLCs the client offered on it are watched, so a preimage learned later arms a claim there too. A missing `revoke_and_ack` after a fulfil now fails the channel, as an invalid one already did; a failed channel is not revealed any further preimage, and its HTLCs are claimed from whichever commitment it broadcasts.
+- **A payee that stalls after its fulfil no longer stops the payment.** The LSP holds the preimage, so the sender is fulfilled upstream even when the payee does not complete the commitment exchange.
 
 ### A member decides its HTLCs from its own state
 

@@ -567,6 +567,53 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     uint64_t old_commitment_num, size_t htlc_index,
     const unsigned char *anchor_spk, size_t anchor_spk_len);
 
+/* --- On-chain HTLC-success claim (BOLT #5) ---
+   Claims an HTLC that pays us, using its preimage, from whichever
+   commitment reached the chain.  The HTLC outputs are single-key tapscript
+   leaves, so there is no pre-signed second-stage transaction: the claim
+   spends the HTLC output directly via its success leaf.
+     HTLC_CLAIM_LOCAL_COMMIT:  our commitment; the HTLC is "received", the
+                               success leaf carries our to_self_delay CSV.
+     HTLC_CLAIM_REMOTE_COMMIT: the counterparty's commitment; the HTLC is
+                               "offered" there, the success leaf has no CSV.
+   pcp is the per-commitment point of the commitment holding the HTLC
+   (ours for LOCAL, theirs for REMOTE).  The claim pays to the same
+   key-path P2TR(local_payment_basepoint) as the HTLC-timeout path, so its
+   output is swept with channel_build_htlc_output_sweep. */
+#define HTLC_CLAIM_LOCAL_COMMIT  0
+#define HTLC_CLAIM_REMOTE_COMMIT 1
+
+/* Rebuild the scriptPubKey of the HTLC output we can claim.  Returns 1. */
+int channel_htlc_claim_spk(const channel_t *ch, int side,
+    const secp256k1_pubkey *pcp, const unsigned char *payment_hash32,
+    uint32_t cltv_expiry, unsigned char *spk_out34);
+
+/* 1 if latest_commitment_sig is a valid signature of the commitment ch
+   describes now, i.e. we hold that commitment signed and can broadcast
+   it.  After a local update the counterparty has not signed yet, the
+   current state is not that commitment. */
+int channel_holds_signed_commitment(const channel_t *ch);
+
+/* Virtual size of a claim, for its fee. */
+#define HTLC_CLAIM_VSIZE 180
+
+/* Fee of a claim at the channel fee rate (the HTLC-timeout fee rule). */
+uint64_t channel_htlc_claim_fee(const channel_t *ch);
+
+/* Build and sign the claim.  fee_sats is the fee to pay; 0 means
+   channel_htlc_claim_fee(ch).  Fails closed (returns 0) if the preimage
+   does not hash to payment_hash32, if the rebuilt script does not match
+   htlc_spk34, or if the output would be dust.  Signing is deterministic,
+   so rebuilding with the same fee yields the same transaction.
+   out_amount and txid_out32 (display byte order) are optional. */
+int channel_build_htlc_claim_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    int side, const secp256k1_pubkey *pcp,
+    const unsigned char *commitment_txid, uint32_t htlc_vout,
+    uint64_t htlc_amount, const unsigned char *htlc_spk34,
+    const unsigned char *payment_hash32, const unsigned char *preimage32,
+    uint32_t cltv_expiry, uint64_t fee_sats, uint64_t *out_amount,
+    unsigned char *txid_out32);
+
 /* --- PTLC resolution transactions (Phase 5: production wiring) --- */
 
 int channel_build_ptlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
