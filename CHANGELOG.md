@@ -28,6 +28,10 @@ Operator-visible behaviour changes.
 - **The preimage goes out only for an HTLC that pays the invoice.** Before it fulfils, the client daemon requires the HTLC to carry at least the invoiced amount (BOLT 4: never less) and to expire at least `CLIENT_MIN_FINAL_CLTV_DELTA` (18) blocks after its own chain tip (`client_htlc_pays_invoice`, `client_settle_invoice_htlc`). Otherwise it fails the HTLC back with `incorrect_or_unknown_payment_details`, keeps the preimage and leaves the invoice open. Without a chain tip the HTLC is failed.
 - **No invoice without fresh randomness.** Invoice preimages come from `getrandom`, else `/dev/urandom` (`client_new_invoice_preimage`). If neither can be read, no invoice is created and the client answers the LSP's `CREATE_INVOICE` with `MSG_ERROR`; the fixed fallback preimage is gone.
 
+### Watchtower
+
+- **Breaches are found by scanning blocks; `-txindex` is not needed.** Besides the usual window of recent blocks, every pass searches each block since a stored scan floor (`wt_meta.scan_from`, kept in the watchtower database and moved up as the tower scans). A standalone tower started after the breach was mined, or stopped for longer than the window, finds the breach and sends the penalty on a node without a transaction index. A new database starts its floor at the height it is opened at. The same `watchtower_check` runs in the LSP, so the in-process tower restarts from its stored floor too.
+
 ### Reorg handling fixes (#201, #206, #210)
 
 - **False reorgs:** the tip height and hash were read with two RPCs, so a block arriving between them produced a mismatched pair and a later `FORWARD_REORG` that never happened. Both now come from one `getblockchaininfo` call (`regtest_get_tip`), and classification is a pure function (`lsp_reorg_classify`).

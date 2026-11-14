@@ -280,6 +280,46 @@ int persist_wt_count_active_watches(const persist_wt_t *pwt) {
     return n;
 }
 
+int persist_wt_get_scan_from(const persist_wt_t *pwt, int *h_out) {
+    if (!pwt || !pwt->db || !h_out) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(pwt->db,
+            "SELECT value FROM wt_meta WHERE key = 'scan_from';",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *h_out = atoi((const char *)sqlite3_column_text(st, 0));
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+static int wt_put_scan_from(persist_wt_t *pwt, int h, int only_if_absent) {
+    if (!pwt || !pwt->db || h < 0) return 0;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", h);
+    const char *sql = only_if_absent
+        ? "INSERT OR IGNORE INTO wt_meta (key, value) VALUES ('scan_from', ?);"
+        : "INSERT INTO wt_meta (key, value) VALUES ('scan_from', ?) "
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(pwt->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE;
+}
+
+int persist_wt_set_scan_from(persist_wt_t *pwt, int h) {
+    return wt_put_scan_from(pwt, h, 0);
+}
+
+int persist_wt_note_scan_from(persist_wt_t *pwt, int h) {
+    return wt_put_scan_from(pwt, h, 1);
+}
+
 int persist_wt_list_watches_by_kind(persist_wt_t *pwt,
                                       wt_watch_kind_t kind,
                                       persist_wt_watch_cb cb,
