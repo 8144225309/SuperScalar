@@ -1576,6 +1576,7 @@ extern int test_regtest_penalty_with_htlcs(void);
 extern int test_regtest_multi_htlc_unilateral(void);
 extern int test_regtest_watchtower_mempool_detection(void);
 extern int test_regtest_watchtower_late_detection(void);
+extern int test_regtest_watchtower_breach_beyond_128(void);
 extern int test_regtest_fee_estimation_parsing(void);
 extern int test_regtest_ptlc_no_coop_close(void);
 extern int test_regtest_all_offline_recovery(void);
@@ -1612,6 +1613,23 @@ extern int test_subfactory_node_watch(void);
 extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 extern int test_ptlc_penalty_watch(void);
+
+/* Revocation fail-closed (invalid REVOKE_AND_ACK fails the channel) */
+extern int test_lsp_fulfill_rejects_invalid_revocation(void);
+extern int test_lsp_bridge_add_rejects_invalid_revocation(void);
+extern int test_client_rejects_invalid_lsp_revocation(void);
+extern int test_failed_channel_mark_persists(void);
+extern int test_lsp_add_sender_rejects_invalid_revocation(void);
+extern int test_lsp_fulfill_settles_upstream_after_invalid_revocation(void);
+extern int test_lsp_watch_failure_fails_channel(void);
+extern int test_lsp_reconnect_retransmit_rejects_invalid_revocation(void);
+extern int test_failed_mark_durable_vs_reconnect_session(void);
+extern int test_persist_jit_failed_column_migration(void);
+
+/* Watchtower capacity + registration failure (growable table) */
+extern int test_watchtower_watches_1000_revoked_commitments(void);
+extern int test_watchtower_failed_registration_keeps_last_entry(void);
+extern int test_watchtower_rebuild_grows_htlc_array(void);
 
 /* CPFP Anchor System */
 extern int test_penalty_tx_has_anchor(void);
@@ -3743,6 +3761,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_penalty_watch);
     RUN_TEST(test_ptlc_penalty_watch);
 
+    printf("\n=== Revocation Fail-Closed ===\n");
+    RUN_TEST(test_lsp_fulfill_rejects_invalid_revocation);
+    RUN_TEST(test_lsp_bridge_add_rejects_invalid_revocation);
+    RUN_TEST(test_client_rejects_invalid_lsp_revocation);
+    RUN_TEST(test_failed_channel_mark_persists);
+    RUN_TEST(test_lsp_add_sender_rejects_invalid_revocation);
+    RUN_TEST(test_lsp_fulfill_settles_upstream_after_invalid_revocation);
+    RUN_TEST(test_lsp_watch_failure_fails_channel);
+    RUN_TEST(test_lsp_reconnect_retransmit_rejects_invalid_revocation);
+    RUN_TEST(test_failed_mark_durable_vs_reconnect_session);
+    RUN_TEST(test_persist_jit_failed_column_migration);
+
+    printf("\n=== Watchtower Capacity ===\n");
+    RUN_TEST(test_watchtower_watches_1000_revoked_commitments);
+    RUN_TEST(test_watchtower_failed_registration_keeps_last_entry);
+    RUN_TEST(test_watchtower_rebuild_grows_htlc_array);
+
     printf("\n=== CPFP Anchor System ===\n");
     RUN_TEST(test_penalty_tx_has_anchor);
     RUN_TEST(test_htlc_penalty_tx_has_anchor);
@@ -4579,6 +4614,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_multi_htlc_unilateral);
     RUN_TEST(test_regtest_watchtower_mempool_detection);
     RUN_TEST(test_regtest_watchtower_late_detection);
+    RUN_TEST(test_regtest_watchtower_breach_beyond_128);
     RUN_TEST(test_regtest_ptlc_no_coop_close);
     RUN_TEST(test_regtest_all_offline_recovery);
     RUN_TEST(test_regtest_tree_ordering);

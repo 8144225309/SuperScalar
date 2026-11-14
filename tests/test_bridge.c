@@ -6,6 +6,7 @@
 #include "superscalar/tor.h"
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
+#include "superscalar/lsp_channels_internal.h"
 #include "superscalar/client.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
@@ -4334,6 +4335,25 @@ static void pay_fixture_free(pay_fixture_t *f) {
     free(f->lsp);
 }
 
+/* Hand the LSP a REVOKE_AND_ACK carrying secret32 for the fixture's
+   channel 0, as the client would send it. */
+static int pay_fixture_accept_secret(pay_fixture_t *f, channel_t *ch,
+                                     secp256k1_context *ctx,
+                                     const unsigned char *secret32) {
+    unsigned char nk[32];
+    memset(nk, 0x5a, 32);
+    secp256k1_pubkey next;
+    if (!secp256k1_ec_pubkey_create(ctx, &next, nk)) return -1;
+    f->mgr.ctx = ctx;
+    cJSON *raa = wire_build_revoke_and_ack(f->mgr.entries[0].channel_id,
+                                           secret32, ctx, &next);
+    if (!raa) return -1;
+    int ok = lsp_channels_accept_revocation(&f->mgr, f->lsp, 0, ch, raa,
+                                            NULL, NULL);
+    cJSON_Delete(raa);
+    return ok;
+}
+
 static int deliver_pay_result(pay_fixture_t *f, uint64_t request_id, int success,
                               const unsigned char *preimage) {
     cJSON *res = wire_build_bridge_pay_result(request_id, success, preimage);
@@ -6033,11 +6053,12 @@ int test_lsp_refuses_bad_revocation_secret(void) {
     ch->ctx = ctx;
     TEST_ASSERT_EQ(ch->commitment_number, 1, "one commitment to revoke");
     channel_set_remote_pcp(ch, 0, &committed);
-    int ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, bad);
+    int ok = pay_fixture_accept_secret(&f, ch, ctx, bad);
     TEST_ASSERT_EQ(ok, 0, "wrong secret refused");
     TEST_ASSERT(!ch->received_revocation_valid || !ch->received_revocation_valid[0],
                 "nothing stored for the commitment");
     TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
+    TEST_ASSERT(ch->revocation_failed, "channel failed");
     wire_msg_t m;
     TEST_ASSERT(!wire_recv_timeout(f.client_peer, &m, 1),
                 "the LSP released nothing: no revocation of its own was sent");
@@ -6049,7 +6070,7 @@ int test_lsp_refuses_bad_revocation_secret(void) {
     ch = &f.mgr.entries[0].channel;
     ch->ctx = ctx;
     channel_set_remote_pcp(ch, 0, &committed);
-    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    ok = pay_fixture_accept_secret(&f, ch, ctx, good);
     TEST_ASSERT_EQ(ok, 1, "matching secret accepted");
     TEST_ASSERT(ch->received_revocation_valid && ch->received_revocation_valid[0],
                 "stored");
@@ -6060,7 +6081,7 @@ int test_lsp_refuses_bad_revocation_secret(void) {
     unsigned char h[32];
     memset(h, 0x35, 32);
     TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 1000, h, 500, &extra), "next commitment");
-    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    ok = pay_fixture_accept_secret(&f, ch, ctx, good);
     TEST_ASSERT_EQ(ok, 0, "no committed point: refused");
     TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
     ch->ctx = NULL;
@@ -6287,7 +6308,7 @@ int test_lsp_unrevoked_htlc_is_failed(void) {
     TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing revoked yet");
 
     /* A refused secret leaves it unrevoked */
-    int ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, bad);
+    int ok = pay_fixture_accept_secret(&f, ch, ctx, bad);
     TEST_ASSERT_EQ(ok, 0, "refused");
     TEST_ASSERT(!lsp_channels_peer_revoked(ch), "still unrevoked");
 
@@ -6318,7 +6339,7 @@ int test_lsp_unrevoked_htlc_is_failed(void) {
     ch = &f.mgr.entries[0].channel;
     ch->ctx = ctx;
     channel_set_remote_pcp(ch, 0, &committed);
-    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    ok = pay_fixture_accept_secret(&f, ch, ctx, good);
     TEST_ASSERT_EQ(ok, 1, "accepted");
     TEST_ASSERT(lsp_channels_peer_revoked(ch), "revoked");
     unsigned char h[32];

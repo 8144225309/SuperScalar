@@ -6,6 +6,11 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Revocations must verify; every revoked commitment stays watched
+
+- **Invalid revocations fail the channel.** A peer could answer a commitment update with a revocation that does not verify and keep an older commitment that can never be penalised. Such a revocation now fails the channel: nothing on it is watched, revealed or forwarded, the peer is disconnected and refused, and the failure is persisted unless it arrived on a session opened by a reconnect; the client applies its `--on-lsp-forgery` policy to an LSP revocation that does not verify.
+- **Every revoked commitment is watched.** Revoked commitments beyond the watchtower's first 128 were dropped silently, so a breach of one went unpunished. The watch table now grows as needed and is fully reloaded on restart, and a revoked commitment that cannot be watched fails the channel.
+
 ### A member decides its HTLCs from its own state
 
 Operator-visible behaviour changes.

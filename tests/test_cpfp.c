@@ -136,10 +136,12 @@ int test_penalty_tx_has_anchor(void) {
     secp256k1_pubkey rvp;
     secp256k1_ec_pubkey_create(ctx, &rvp, client_secret0);
     channel_set_remote_pcp(&lsp_ch, 0, &rvp);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
     secp256k1_ec_pubkey_create(ctx, &rvp, lsp_secret0);
     channel_set_remote_pcp(&client_ch, 0, &rvp);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Build local commitment #0 to get to_local SPK */
     tx_buf_t commit_tx;
@@ -260,10 +262,12 @@ int test_htlc_penalty_tx_has_anchor(void) {
     secp256k1_pubkey rvp;
     secp256k1_ec_pubkey_create(ctx, &rvp, client_secret0);
     channel_set_remote_pcp(&lsp_ch, 0, &rvp);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
     secp256k1_ec_pubkey_create(ctx, &rvp, lsp_secret0);
     channel_set_remote_pcp(&client_ch, 0, &rvp);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Get the HTLC output info from the old commitment.
        For this unit test we just need a plausible SPK and txid. */
