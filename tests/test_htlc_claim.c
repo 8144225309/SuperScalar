@@ -2780,43 +2780,60 @@ static int run_lsp_payee(int restart)
     }
     TEST_ASSERT(s == 1, "drill setup");
 
+    int ok = 0;
+    int have_pair = 0, have_db = 0, have_sw = 0, have_tmo = 0, have_path = 0;
+    lsp_channel_mgr_t *mgr = NULL;
+    channel_t *lch = NULL;
+    sweeper_t sw;
+    persist_t db;
+    tx_buf_t tmo;
+    char path[] = "/tmp/ss_htlc_drill_XXXXXX";
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        goto done; \
+    } \
+} while (0)
+
     pair_t p;
-    TEST_ASSERT(pair_init(&p, ctx, d.fund_txid, d.fund_vout, d.fund_amount, 10),
+    CHECK(pair_init(&p, ctx, d.fund_txid, d.fund_vout, d.fund_amount, 10),
                 "pair");
+    have_pair = 1;
     int h0 = regtest_get_block_height(&d.rt);
     uint32_t cltv = (uint32_t)h0 + 25;
-    TEST_ASSERT(pair_add_htlc(&p, 1, 20000, cltv), "client adds HTLC");
+    CHECK(pair_add_htlc(&p, 1, 20000, cltv), "client adds HTLC");
 
     /* LSP side: manager with one channel and a persistent sweeper. */
-    char path[] = "/tmp/ss_htlc_drill_XXXXXX";
     int fd = mkstemp(path);
-    TEST_ASSERT(fd >= 0, "temp db");
+    CHECK(fd >= 0, "temp db");
+    have_path = 1;
     close(fd);              /* empty 0600 file: opened as a new DB */
-    persist_t db;
-    TEST_ASSERT(persist_open(&db, path), "lsp db");
-    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
-    TEST_ASSERT(mgr != NULL, "mgr");
+    CHECK(persist_open(&db, path), "lsp db");
+    have_db = 1;
+    mgr = calloc(1, sizeof(*mgr));
+    CHECK(mgr != NULL, "mgr");
     mgr->entries = calloc(1, sizeof(lsp_channel_entry_t));
-    TEST_ASSERT(mgr->entries != NULL, "entries");
+    CHECK(mgr->entries != NULL, "entries");
     mgr->n_channels = 1;
+    /* The manager takes over the LSP side of the pair. */
     memcpy(&mgr->entries[0].channel, &p.lsp, sizeof(channel_t));
-    channel_t *lch = &mgr->entries[0].channel;
-    sweeper_t sw;
-    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
+    lch = &mgr->entries[0].channel;
+    CHECK(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
                 "sweeper");
+    have_sw = 1;
     lsp_channels_attach_sweeper(mgr, &sw);
     char dest_addr[128];
-    TEST_ASSERT(regtest_get_new_address(&d.rt, dest_addr, sizeof(dest_addr)),
+    CHECK(regtest_get_new_address(&d.rt, dest_addr, sizeof(dest_addr)),
                 "dest addr");
     size_t dl = 0;
-    TEST_ASSERT(regtest_get_address_scriptpubkey(&d.rt, dest_addr, sw.dest_spk,
+    CHECK(regtest_get_address_scriptpubkey(&d.rt, dest_addr, sw.dest_spk,
                                                  &dl) && dl == 34, "dest spk");
     sw.dest_spk_len = 34;
 
     /* LSP reveals the preimage: production hook, then the fulfil. */
     int reg = lsp_channels_register_htlc_claim(mgr, 0, p.lsp_htlc_id,
                                                p.preimage);
-    TEST_ASSERT(channel_fulfill_htlc(lch, p.lsp_htlc_id, p.preimage),
+    CHECK(channel_fulfill_htlc(lch, p.lsp_htlc_id, p.preimage),
                 "LSP fulfils");
     /* The client never sends its revoke_and_ack: nothing cancels the claim. */
 
@@ -2824,28 +2841,32 @@ static int run_lsp_payee(int restart)
        HTLC-timeout from it. */
     unsigned char ct[32];
     char ct_hex[65];
-    TEST_ASSERT(broadcast_commitment(&d, &p.cli, &p.lsp_kp, ct, ct_hex),
+    CHECK(broadcast_commitment(&d, &p.cli, &p.lsp_kp, ct, ct_hex),
                 "client broadcasts commitment holding the HTLC");
     regtest_mine_blocks(&d.rt, 1, d.mine_addr);
-    TEST_ASSERT(regtest_get_confirmations(&d.rt, ct_hex) >= 1,
+    CHECK(regtest_get_confirmations(&d.rt, ct_hex) >= 1,
                 "commitment confirmed");
     uint32_t vout = 2;
     uint64_t amt = 0; unsigned char spk[64]; size_t sl = 0;
-    TEST_ASSERT(regtest_get_tx_output(&d.rt, ct_hex, vout, &amt, spk, &sl) &&
+    CHECK(regtest_get_tx_output(&d.rt, ct_hex, vout, &amt, spk, &sl) &&
                 sl == 34 && amt == 20000, "HTLC output on chain");
-    tx_buf_t tmo;
     tx_buf_init(&tmo, 512);
-    TEST_ASSERT(channel_build_htlc_timeout_tx(&p.cli, &tmo, ct, vout, amt,
+    have_tmo = 1;
+    CHECK(channel_build_htlc_timeout_tx(&p.cli, &tmo, ct, vout, amt,
                                               spk, 34, 0),
                 "attacker timeout built");
 
     int reloaded = 1;
     if (restart) {
         sweeper_cleanup(&sw);
+        have_sw = 0;
         persist_close(&db);
-        TEST_ASSERT(persist_open(&db, path), "lsp db reopen");
-        TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
+        have_db = 0;
+        CHECK(persist_open(&db, path), "lsp db reopen");
+        have_db = 1;
+        CHECK(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
                     "sweeper reload");
+        have_sw = 1;
         lsp_channels_attach_sweeper(mgr, &sw);
         size_t dl2 = 0;
         regtest_get_address_scriptpubkey(&d.rt, dest_addr, sw.dest_spk, &dl2);
@@ -2863,28 +2884,28 @@ static int run_lsp_payee(int restart)
         char claim_txid[65];
         memcpy(claim_txid, sw.entries[0].sweep_txid, 65);
         int hb = regtest_get_block_height(&d.rt);
-        TEST_ASSERT((uint32_t)hb < cltv, "claim broadcast before the CLTV");
+        CHECK((uint32_t)hb < cltv, "claim broadcast before the CLTV");
         regtest_mine_blocks(&d.rt, 1, d.mine_addr);
-        TEST_ASSERT(regtest_get_confirmations(&d.rt, claim_txid) >= 1,
+        CHECK(regtest_get_confirmations(&d.rt, claim_txid) >= 1,
                     "claim confirmed");
         printf("  claim %s confirmed at height %d (cltv %u)\n", claim_txid,
                hb + 1, cltv);
-        TEST_ASSERT(regtest_outpoint_unspent(&d.rt, ct_hex, vout) == 0,
+        CHECK(regtest_outpoint_unspent(&d.rt, ct_hex, vout) == 0,
                     "HTLC output spent by the claim");
 
         /* Buried -> claim output swept to the destination. */
         sweeper_check(&sw);
-        TEST_ASSERT(sw.n_entries == 1 &&
+        CHECK(sw.n_entries == 1 &&
                     sw.entries[0].type == SWEEP_HTLC_SUCCESS_OUTPUT &&
                     sw.entries[0].state == SWEEP_BROADCAST,
                     "claim output sweep broadcast");
         char sweep_txid[65];
         memcpy(sweep_txid, sw.entries[0].sweep_txid, 65);
         regtest_mine_blocks(&d.rt, 1, d.mine_addr);
-        TEST_ASSERT(regtest_get_confirmations(&d.rt, sweep_txid) >= 1,
+        CHECK(regtest_get_confirmations(&d.rt, sweep_txid) >= 1,
                     "sweep confirmed");
         sweeper_check(&sw);
-        TEST_ASSERT(sw.n_entries == 0, "all entries done");
+        CHECK(sw.n_entries == 0, "all entries done");
         claimed = 1;
     }
 
@@ -2902,21 +2923,29 @@ static int run_lsp_payee(int restart)
     } else {
         printf("  sender's timeout claim rejected after CLTV\n");
     }
-    TEST_ASSERT(reg == 1, "claim registered before reveal");
-    TEST_ASSERT(reloaded, "claim reloaded after restart");
-    TEST_ASSERT(claimed, "payee claimed the HTLC on chain");
-    TEST_ASSERT(!tmo_ok, "sender's timeout rejected (HTLC already claimed)");
+    CHECK(reg == 1, "claim registered before reveal");
+    CHECK(reloaded, "claim reloaded after restart");
+    CHECK(claimed, "payee claimed the HTLC on chain");
+    CHECK(!tmo_ok, "sender's timeout rejected (HTLC already claimed)");
 
-    tx_buf_free(&tmo);
-    sweeper_cleanup(&sw);
-    persist_close(&db);
-    unlink(path);
-    channel_cleanup(lch);
-    free(mgr->entries);
-    free(mgr);
-    channel_cleanup(&p.cli);
+    ok = 1;
+done:
+#undef CHECK
+    if (have_tmo) tx_buf_free(&tmo);
+    if (have_sw) sweeper_cleanup(&sw);
+    if (have_db) persist_close(&db);
+    if (have_path) unlink(path);
+    if (have_pair) {
+        if (lch) channel_cleanup(lch);      /* the LSP side, now the manager's */
+        else channel_cleanup(&p.lsp);
+        channel_cleanup(&p.cli);
+    }
+    if (mgr) {
+        free(mgr->entries);
+        free(mgr);
+    }
     secp256k1_context_destroy(ctx);
-    return 1;
+    return ok;
 }
 
 int test_regtest_htlc_claim_lsp_payee(void) { return run_lsp_payee(0); }
