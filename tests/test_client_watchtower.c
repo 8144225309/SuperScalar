@@ -184,7 +184,8 @@ int test_client_watch_revoked_commitment(void) {
     /* LSP reveals its old secret to client */
     unsigned char lsp_old_secret[32];
     channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
-    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, old_cn, lsp_old_secret),
+                "client stores the LSP revocation");
 
     /* Exchange new PCPs */
     secp256k1_pubkey lsp_new_pcp;
@@ -193,10 +194,11 @@ int test_client_watch_revoked_commitment(void) {
 
     /* Client registers the old LSP commitment with watchtower */
     size_t entries_before = wt.n_entries;
-    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+    TEST_ASSERT(watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
                                           NULL, 0,
-                                          /* SF-W-PTLC */ NULL, 0);
+                                          /* SF-W-PTLC */ NULL, 0),
+                "revoked commitment registered");
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -448,7 +450,8 @@ int test_htlc_penalty_watch(void) {
     /* LSP reveals old secret to client */
     unsigned char lsp_old_secret[32];
     channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
-    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, old_cn, lsp_old_secret),
+                "client stores the LSP revocation");
 
     /* Exchange new PCPs */
     secp256k1_pubkey lsp_new_pcp;
@@ -457,10 +460,11 @@ int test_htlc_penalty_watch(void) {
 
     /* Register old commitment WITH HTLC state */
     size_t entries_before = wt.n_entries;
-    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+    TEST_ASSERT(watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
                                           old_htlcs, old_n_htlcs,
-                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
+                                    /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0),
+                "revoked commitment registered");
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -579,7 +583,8 @@ int test_ptlc_penalty_watch(void) {
     /* LSP reveals old secret to client */
     unsigned char lsp_old_secret[32];
     channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
-    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, old_cn, lsp_old_secret),
+                "client stores the LSP revocation");
 
     secp256k1_pubkey lsp_new_pcp;
     channel_get_per_commitment_point(&lsp_ch, lsp_ch.commitment_number + 1, &lsp_new_pcp);
@@ -587,10 +592,11 @@ int test_ptlc_penalty_watch(void) {
 
     /* Register old commitment WITH PTLC state — the new feed should fire */
     size_t entries_before = wt.n_entries;
-    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+    TEST_ASSERT(watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
                                           old_local, old_remote,
                                           /* no HTLCs */ NULL, 0,
-                                          old_ptlcs, old_n_ptlcs);
+                                          old_ptlcs, old_n_ptlcs),
+                "revoked commitment registered");
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -746,12 +752,14 @@ int test_adversarial_wt_no_false_penalty(void) {
     client_ch.commitment_number++; channel_generate_local_pcs(&client_ch, client_ch.commitment_number);
     unsigned char lsp_old_secret[32];
     channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
-    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, old_cn, lsp_old_secret),
+                "client stores the LSP revocation");
     secp256k1_pubkey lsp_new_pcp;
     channel_get_per_commitment_point(&lsp_ch, lsp_ch.commitment_number + 1, &lsp_new_pcp);
     channel_set_remote_pcp(&client_ch, client_ch.commitment_number + 1, &lsp_new_pcp);
-    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
-                                          old_local, old_remote, NULL, 0, NULL, 0);
+    TEST_ASSERT(watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+                                          old_local, old_remote, NULL, 0, NULL, 0),
+                "revoked commitment registered");
     TEST_ASSERT(wt.n_entries == 1, "one watched entry");
 
     adv_mock_t ms = { .height = 500, .mode = 0, .send_count = 0, .batch_called = 0 };

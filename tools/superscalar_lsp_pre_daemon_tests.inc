@@ -3140,11 +3140,12 @@
             /* Step 4: Register old state with watchtower.  The feed should
                populate entry->ptlc_outputs from br_old_ptlcs. */
             size_t br_entries_before = ptlc_wt->n_entries;
-            watchtower_watch_revoked_commitment(ptlc_wt, ch0_p,
+            if (!watchtower_watch_revoked_commitment(ptlc_wt, ch0_p,
                 0, /* channel_id */
                 br_old_commit_num, br_old_local, br_old_remote,
                 br_old_htlcs, br_old_n_htlcs,
-                br_old_ptlcs, br_old_n_ptlcs);
+                br_old_ptlcs, br_old_n_ptlcs))
+                fprintf(stderr, "PTLC BREACH TEST: watchtower registration reported failure\n");
 
             /* Step 5: Verify entry registered + ptlc_outputs populated. */
             if (ptlc_wt->n_entries != br_entries_before + 1) {
@@ -3380,10 +3381,11 @@
             }
             memcpy(re_old_ptlcs, ch0_r->ptlcs, re_old_n_ptlcs * sizeof(ptlc_t));
 
-            watchtower_watch_revoked_commitment(re_wt, ch0_r,
+            if (!watchtower_watch_revoked_commitment(re_wt, ch0_r,
                 0, re_old_commit_num, re_old_local, re_old_remote,
                 re_old_htlcs, re_old_n_htlcs,
-                re_old_ptlcs, re_old_n_ptlcs);
+                re_old_ptlcs, re_old_n_ptlcs))
+                fprintf(stderr, "PTLC RESTART TEST: watchtower registration reported failure\n");
 
             /* Capture expected fields from the watchtower entry. */
             if (re_wt->n_entries == 0) {
@@ -3886,10 +3888,11 @@
 
             /* Step 5: Register revoked state with watchtower */
             size_t bc_entries_before = bc_wt->n_entries;
-            watchtower_watch_revoked_commitment(bc_wt, ch0_bc, 0,
+            if (!watchtower_watch_revoked_commitment(bc_wt, ch0_bc, 0,
                 bc_old_cn, bc_old_local, bc_old_remote,
                 bc_old_htlcs, bc_n_h,
-                bc_old_ptlcs, bc_n_p);
+                bc_old_ptlcs, bc_n_p))
+                fprintf(stderr, "PTLC BREACH CHAIN: watchtower registration reported failure\n");
             if (bc_wt->n_entries != bc_entries_before + 1) {
                 fprintf(stderr, "PTLC BREACH CHAIN: watchtower entry not registered\n");
                 free(bc_old_htlcs); free(bc_old_ptlcs);

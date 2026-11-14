@@ -370,7 +370,8 @@ static const char *SCHEMA_SQL =
     "  created_at INTEGER,"
     "  created_block INTEGER,"
     "  target_factory_id INTEGER DEFAULT 0,"
-    "  funding_tx_hex TEXT"
+    "  funding_tx_hex TEXT,"
+    "  revocation_failed INTEGER NOT NULL DEFAULT 0"
     ");"
     /* Phase 2: Flat revocation secrets (item 2.8) */
     "CREATE TABLE IF NOT EXISTS factory_revocation_secrets ("
@@ -464,6 +465,22 @@ static const char *SCHEMA_SQL =
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
     ");"
     PERSIST_V43_TABLES_SQL;
+
+/* 1 if `table` has a column named `col` (PRAGMA table_info). */
+static int persist_table_has_column(sqlite3 *db, const char *table,
+                                    const char *col) {
+    char sql[128];
+    snprintf(sql, sizeof sql, "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int found = 0;
+    while (!found && sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 1);
+        found = name && strcmp(name, col) == 0;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
 
 int persist_open(persist_t *p, const char *path) {
     if (!p) return 0;
@@ -1546,6 +1563,25 @@ int persist_open(persist_t *p, const char *path) {
             fprintf(stderr, "persist_open: migration v43 failed: %s\n",
                     merr ? merr : "unknown");
             sqlite3_free(merr);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
+    /* v44: jit_channels.revocation_failed, so a JIT channel whose peer did not
+       validly revoke a commitment stays failed across a restart (factory
+       channels use channels.state).  The column is also in the base schema,
+       and this step adds it whenever it is missing rather than by version
+       number. */
+    if (!persist_table_has_column(p->db, "jit_channels", "revocation_failed")) {
+        char *merr41 = NULL;
+        if (sqlite3_exec(p->db,
+                "ALTER TABLE jit_channels ADD COLUMN revocation_failed "
+                "INTEGER NOT NULL DEFAULT 0;", NULL, NULL, &merr41) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v44 failed: %s\n",
+                    merr41 ? merr41 : "unknown");
+            sqlite3_free(merr41);
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
@@ -3607,13 +3643,18 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     char txid_hex[65];
     hex_encode(txid_display, 32, txid_hex);
 
-    const char *sql =
-        "INSERT OR REPLACE INTO channels "
-        "(id, factory_id, slot, local_amount, remote_amount, funding_amount, "
-        " commitment_number, funding_txid, funding_vout, state, "
-        " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
-        " funding_pending_reorg, commit_fee_rate_sat_per_kvb) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?);";
+    /* The row's state follows the channel: 'failed' only for a durable
+       failure (a session-only failure is never written). */
+#define SAVE_CHANNEL_SQL(state) \
+        "INSERT OR REPLACE INTO channels " \
+        "(id, factory_id, slot, local_amount, remote_amount, funding_amount, " \
+        " commitment_number, funding_txid, funding_vout, state, " \
+        " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, " \
+        " funding_pending_reorg, commit_fee_rate_sat_per_kvb) " \
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, " state ", ?, ?, ?, ?, ?);"
+    const char *sql = ch->revocation_failed == CHANNEL_FAILED_DURABLE
+                      ? SAVE_CHANNEL_SQL("'failed'") : SAVE_CHANNEL_SQL("'open'");
+#undef SAVE_CHANNEL_SQL
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -3798,6 +3839,19 @@ static int persist_save_height_hash(persist_t *p, const char *sql,
     return ok;
 }
 
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE channels SET state = 'failed' WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 static int persist_load_height_hash(persist_t *p, const char *sql,
                                     const char *key, int32_t *height,
                                     char block_hash[65]) {
@@ -3816,6 +3870,19 @@ static int persist_load_height_hash(persist_t *p, const char *sql,
             ok = 1;
         }
     }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_mark_jit_failed(persist_t *p, uint32_t jit_channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE jit_channels SET revocation_failed = 1 "
+            "WHERE jit_channel_id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)jit_channel_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE) && sqlite3_changes(p->db) == 1;
     sqlite3_finalize(stmt);
     return ok;
 }
@@ -3869,6 +3936,23 @@ int persist_load_channel_funding_reorg(persist_t *p, uint32_t channel_id,
     }
     sqlite3_finalize(stmt);
     return ok;
+}
+
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT state FROM channels WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int failed = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *st = (const char *)sqlite3_column_text(stmt, 0);
+        failed = (st && strcmp(st, "failed") == 0);
+    }
+    sqlite3_finalize(stmt);
+    return failed;
 }
 
 int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
@@ -4399,6 +4483,66 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+int persist_load_all_old_commitments(persist_t *p,
+                                     persist_old_commitment_row_t **rows_out,
+                                     size_t *n_out) {
+    if (!rows_out || !n_out) return 0;
+    *rows_out = NULL;
+    *n_out = 0;
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT channel_id, commit_num, txid, to_local_vout, to_local_amount, "
+        "       to_local_spk, csv_delay "
+        "FROM old_commitments ORDER BY channel_id ASC, commit_num ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    persist_old_commitment_row_t *rows = NULL;
+    size_t n = 0, cap = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t new_cap = cap ? cap * 2 : 64;
+            persist_old_commitment_row_t *tmp =
+                realloc(rows, new_cap * sizeof(*rows));
+            if (!tmp) {
+                sqlite3_finalize(stmt);
+                free(rows);
+                return 0;
+            }
+            rows = tmp;
+            cap = new_cap;
+        }
+        persist_old_commitment_row_t *r = &rows[n];
+        memset(r, 0, sizeof(*r));
+        r->channel_id = (uint32_t)sqlite3_column_int(stmt, 0);
+        r->commit_num = (uint64_t)sqlite3_column_int64(stmt, 1);
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 2);
+        if (txid_hex)
+            hex_decode(txid_hex, r->txid, 32);
+        r->to_local_vout = (uint32_t)sqlite3_column_int(stmt, 3);
+        r->to_local_amount = (uint64_t)sqlite3_column_int64(stmt, 4);
+        const char *spk_hex = (const char *)sqlite3_column_text(stmt, 5);
+        if (spk_hex) {
+            int decoded = hex_decode(spk_hex, r->to_local_spk, 34);
+            r->to_local_spk_len = decoded > 0 ? (size_t)decoded : 0;
+        }
+        r->csv_delay = (uint32_t)sqlite3_column_int(stmt, 6);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        free(rows);
+        return 0;
+    }
+    *rows_out = rows;
+    *n_out = n;
+    return 1;
 }
 
 /* --- v25: pre-built penalty TX bytes (closes restart-loses-defense gap) --- */
@@ -6793,8 +6937,9 @@ int persist_save_jit_channel(persist_t *p, const void *jit_ptr) {
         "INSERT OR REPLACE INTO jit_channels "
         "(jit_channel_id, client_idx, state, funding_txid, funding_vout, "
         "funding_amount, local_amount, remote_amount, commitment_number, "
-        "created_at, created_block, target_factory_id, funding_tx_hex) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "created_at, created_block, target_factory_id, funding_tx_hex, "
+        "revocation_failed) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -6816,6 +6961,8 @@ int persist_save_jit_channel(persist_t *p, const void *jit_ptr) {
         sqlite3_bind_text(stmt, 13, jit->funding_tx_hex, -1, SQLITE_TRANSIENT);
     else
         sqlite3_bind_null(stmt, 13);
+    sqlite3_bind_int(stmt, 14,
+        jit->channel.revocation_failed == CHANNEL_FAILED_DURABLE ? 1 : 0);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -6830,7 +6977,8 @@ size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
     const char *sql =
         "SELECT jit_channel_id, client_idx, state, funding_txid, funding_vout, "
         "funding_amount, local_amount, remote_amount, commitment_number, "
-        "created_at, created_block, target_factory_id, funding_tx_hex "
+        "created_at, created_block, target_factory_id, funding_tx_hex, "
+        "revocation_failed "
         "FROM jit_channels ORDER BY jit_channel_id;";
 
     sqlite3_stmt *stmt;
@@ -6865,6 +7013,8 @@ size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
             strncpy(jit->funding_tx_hex, ftx_hex, sizeof(jit->funding_tx_hex) - 1);
             jit->funding_tx_hex[sizeof(jit->funding_tx_hex) - 1] = '\0';
         }
+        jit->channel.revocation_failed =
+            sqlite3_column_int(stmt, 13) ? CHANNEL_FAILED_DURABLE : 0;
         count++;
     }
 

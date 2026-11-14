@@ -110,6 +110,8 @@ typedef struct {
     int ready;                  /* 1 after CHANNEL_READY sent */
     time_t last_message_time;   /* epoch timestamp of last wire message */
     int offline_detected;        /* 1 if declared offline */
+    int session_from_reconnect; /* 1 if the current session was opened by
+                                   MSG_RECONNECT */
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */
@@ -920,14 +922,6 @@ size_t lsp_channels_flush_bridge_fails(lsp_channel_mgr_t *mgr);
    Returns how many were handled. */
 size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
-/* Take the revocation secret a client sent for the commitment before the
-   channel's current one.  Returns 1 if it matches the point the client
-   committed to and was stored.  Otherwise nothing is stored, the error is
-   logged and the client's connection is dropped: the caller must not go on
-   with the exchange (no watchtower entry, no revocation of its own). */
-int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
-                                    channel_t *ch,
-                                    const unsigned char *secret32);
 
 /* 1 if the client's revocation of the commitment before the channel's
    current one has been accepted and stored. */
